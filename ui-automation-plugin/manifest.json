@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "UI自动化插件",
+  "version": "1.0.0",
+  "description": "功能完整的页面自动化工具，支持基础操作、高级功能、录制回放等",
+  "action": {
+    "default_title": "UI自动化"
+  },
+  "side_panel": {
+    "default_path": "popup/popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["activeTab", "tabs", "scripting", "sidePanel", "storage", "debugger"],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/content.js", "automation/automation-core.js", "automation/automation-advanced.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

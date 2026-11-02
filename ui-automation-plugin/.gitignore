@@ -1,0 +1,5 @@
+node_modules/
+.extension-id
+*.log
+.DS_Store
+

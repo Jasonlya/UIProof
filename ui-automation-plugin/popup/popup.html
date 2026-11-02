@@ -1,0 +1,191 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>UI自动化插件</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-iecdLmaskl7CVkqkXNQ/ZH/XLlvWZOJyj7Yy7tcenmpD1ypASozpmT/E0iPtmFIB46ZmdtAc9eNBvH0H/ZpiBw==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <!-- 用例管理界面 -->
+      <div id="caseManagement" class="mode-content active">
+        <div class="tree-controls">
+          <div class="control-group execute-controls">
+            <button id="batchExecute" class="btn btn-sm btn-primary" disabled><i class="fas fa-play"></i> 执行</button>
+            <button id="aiExecute" class="btn btn-sm btn-ai" disabled title="使用 Playwright + AI Agent 执行"><i class="fas fa-robot"></i> AI执行</button>
+            <button id="stopAiExecution" class="btn btn-sm btn-danger" style="display:none;"><i class="fas fa-stop"></i> 停止</button>
+            <!-- 是否在执行 UI 用例时启用性能测试 -->
+            <label class="checkbox-inline" style="margin-left: 8px; font-size: 12px;">
+              <input type="checkbox" id="perfOnExecute" style="margin-right: 4px;" />
+              性能测试
+            </label>
+            <span style="margin-left: 6px; font-size: 12px; color: #888;">维度:</span>
+            <label style="margin-left: 4px; font-size: 12px;">
+              <input type="radio" name="perfMode" id="perfModeStep" value="step" checked />
+              单步
+            </label>
+            <label style="margin-left: 4px; font-size: 12px;">
+              <input type="radio" name="perfMode" id="perfModeCase" value="case" />
+              整个用例
+            </label>
+            <div style="flex-basis: 100%; margin-top: 4px; font-size: 11px; color: #888; line-height: 1.35;">
+              采集针对<strong>当前活动标签页</strong>，由扩展内置性能模块完成，无需单独启动 Node 服务。
+            </div>
+          </div>
+          <div class="control-group">
+            <button id="addFolder" class="btn btn-sm btn-outline"><i class="fas fa-folder-plus"></i> 新建</button>
+            <button id="refreshCases" class="btn btn-sm btn-outline"><i class="fas fa-sync-alt"></i> 刷新</button>
+            <button id="batchDelete" class="btn btn-sm btn-outline" disabled><i class="fas fa-trash"></i> 删除</button>
+            <button id="aiGenerateCases" class="btn btn-sm btn-ai" title="分析当前页面，用AI自动生成测试用例"><i class="fas fa-magic"></i> AI生成用例</button>
+          </div>
+          <div class="control-group">
+            <button id="expandAll" class="btn btn-sm btn-outline"><i class="fas fa-chevron-down"></i> 展开</button>
+            <button id="collapseAll" class="btn btn-sm btn-outline"><i class="fas fa-chevron-up"></i> 收起</button>
+            <button id="selectAll" class="btn btn-sm btn-outline"><i class="fas fa-check-square"></i> 全选</button>
+          </div>
+        </div>
+        <div class="cases-list-wrap" id="casesListWrap">
+          <div id="casesList" class="cases-list tree-view">
+            <div class="empty-state">
+              <p><i class="fas fa-file-alt"></i> 暂无用例，点击"新增用例"开始创建</p>
+            </div>
+          </div>
+          <div class="resize-handle" id="casesListResize" title="拖拽调整高度"></div>
+        </div>
+
+        <!-- 性能模块：background 内 CDP Performance.getMetrics（轻量），也可手动启停 -->
+        <div class="section" id="perfToolsSection" style="margin-top: 8px;">
+          <div style="font-size: 12px; color: #666; margin-bottom: 6px;">
+            页面可能出现「正在接受调试」横幅；受限页（如 <code>chrome://</code>）无法采集。
+          </div>
+          <div id="perfManualStatus" class="status" style="font-size: 12px;"></div>
+        </div>
+
+        <!-- 性能测试结果展示区域 -->
+        <div class="section perf-result-panel" id="perfResultPanel" style="margin-top: 8px;">
+          <div class="perf-result-header perf-result-header-actions">
+            <span><i class="fas fa-chart-line"></i> 性能测试结果</span>
+            <span class="perf-result-actions">
+              <button type="button" id="perfTraceStart" class="btn btn-xs btn-outline">开始采集</button>
+              <button type="button" id="perfTraceStop" class="btn btn-xs btn-outline">停止并汇总</button>
+              <button type="button" id="perfViewReport" class="btn btn-xs btn-outline perf-view-report-btn" style="display: none;">查看报告</button>
+              <button type="button" id="perfClearResult" class="btn btn-xs btn-outline">清空</button>
+            </span>
+          </div>
+          <div class="perf-result-body" id="perfResultBody">
+            <div class="empty-state">暂无性能结果，执行带性能测试的用例后会显示在这里</div>
+          </div>
+          <div class="resize-handle" id="perfResultResize" title="拖拽调整高度"></div>
+        </div>
+
+        <!-- AI 执行进度面板 -->
+        <div class="section" id="aiExecutionPanel" style="margin-top: 8px; display: none;">
+          <div class="perf-result-header perf-result-header-actions">
+            <span><i class="fas fa-robot"></i> AI 执行进度</span>
+            <span class="perf-result-actions">
+              <span id="aiExecStatus" style="font-size: 11px; color: #1890ff;">准备中...</span>
+            </span>
+          </div>
+          <div id="aiExecProgress" style="padding: 8px; font-size: 12px; max-height: 200px; overflow-y: auto;">
+            <div class="empty-state">等待执行...</div>
+          </div>
+          <div id="aiExecResult" style="padding: 8px; display: none;">
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <span id="aiResultIcon" style="font-size: 18px;"></span>
+              <span id="aiResultText" style="font-size: 13px; font-weight: 500;"></span>
+            </div>
+            <div id="aiResultDetails" style="margin-top: 6px; font-size: 11px; color: #666;"></div>
+          </div>
+        </div>
+      </div>
+        
+        <!-- 录制界面 -->
+        <div id="recordingMode" class="mode-content">
+          <div class="recording-header">
+            <h3 id="recordingTitle"><i class="fas fa-video"></i> 录制用例</h3>
+            <div class="recording-actions">
+              <button id="saveCase" class="btn btn-success"><i class="fas fa-save"></i> 保存</button>
+              <button id="backToCases" class="btn btn-secondary"><i class="fas fa-arrow-left"></i> 返回用例管理</button>
+            </div>
+          </div>
+          
+          <div class="case-save-section">
+            <div class="case-save-inline">
+              <div class="field wide"><span class="label">名称</span><input type="text" id="caseName" placeholder="名称" required></div>
+              <div class="field wide"><span class="label">描述</span><input id="caseDescription" placeholder="描述"></input></div>
+              <div class="field"><span class="label">标签</span><input type="text" id="caseTags" placeholder="用逗号分隔"></div>
+              <div class="field"><span class="label">状态</span><select id="caseStatus">
+                <option value="active">激活</option>
+                <option value="inactive">未激活</option>
+              </select></div>
+            </div>
+          </div>
+
+          <div class="record-controls">
+            <button id="startRecord" class="btn btn-primary"><i class="fas fa-record-vinyl"></i> 开始录制</button>
+            <button id="stopRecord" class="btn btn-danger" disabled><i class="fas fa-stop"></i> 停止录制</button>
+            <button id="clearRecord" class="btn btn-secondary"><i class="fas fa-eraser"></i> 清空录制</button>
+          </div>
+          
+          <div class="record-status">
+            <div id="recordStatus" class="status">等待开始录制</div>
+            <div id="recordCount" class="count">已录制 0 个操作</div>
+          </div>
+          
+          <div class="play-controls">
+            <button id="playAll" class="btn btn-success"><i class="fas fa-play-circle"></i> 执行全部</button>
+            <button id="playSelected" class="btn btn-secondary"><i class="fas fa-check-circle"></i> 执行选中</button>
+            <button id="addStep" class="btn btn-secondary"><i class="fas fa-plus-circle"></i> 添加步骤</button>
+            <button id="undoStep" class="btn btn-secondary" disabled><i class="fas fa-undo"></i> 撤销</button>
+            <button id="redoStep" class="btn btn-secondary" disabled><i class="fas fa-redo"></i> 重做</button>
+            <div class="field inline">
+              <span class="label">间隔(ms)</span>
+              <input id="playInterval" type="number" min="0" step="100" placeholder="0" value="500" />
+            </div>
+          </div>
+          
+          <div class="steps-container">
+            <h3><i class="fas fa-list"></i> 操作步骤</h3>
+            
+            <div id="stepsList" class="steps-list">
+              <div class="empty-state">
+                <p><i class="fas fa-mouse-pointer"></i> 点击"开始录制"来记录你的操作步骤</p>
+              </div>
+            </div>
+          </div>
+        
+        </div>
+      
+      
+      <div id="status" class="status"></div>
+    </div>
+
+    <!-- AI 生成用例 预览模态框 -->
+    <div id="aiGenerateModal" class="ai-modal-overlay" style="display:none;">
+      <div class="ai-modal">
+        <div class="ai-modal-header">
+          <span><i class="fas fa-magic"></i> AI 生成用例预览</span>
+          <button id="aiModalClose" class="ai-modal-close" title="关闭"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="ai-modal-desc" id="aiModalDesc">正在分析页面，请稍候...</div>
+        <div class="ai-modal-body" id="aiModalBody"></div>
+        <div class="ai-modal-footer">
+          <label class="ai-select-all-label">
+            <input type="checkbox" id="aiSelectAll" checked /> 全选
+          </label>
+          <div class="ai-modal-footer-btns">
+            <button id="aiModalCancel" class="btn btn-sm btn-secondary">取消</button>
+            <button id="aiModalSave" class="btn btn-sm btn-primary" disabled><i class="fas fa-save"></i> 保存选中用例</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 配置文件 -->
+    <script src="../config.js"></script>
+    <!-- ES6 模块化脚本 -->
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

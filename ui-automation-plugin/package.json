@@ -1,0 +1,14 @@
+{
+  "name": "ui-automation-plugin",
+  "version": "1.0.0",
+  "description": "UI自动化插件热更新工具",
+  "scripts": {
+    "dev": "node hot-reload/hot-reload-simple.js",
+    "watch": "node hot-reload/hot-reload-simple.js",
+    "hot-reload": "node hot-reload/hot-reload.js"
+  },
+  "devDependencies": {
+    "chokidar": "^3.5.3"
+  }
+}
+

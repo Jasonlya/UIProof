@@ -1,0 +1,47 @@
+model:
+  # 支持: openai / anthropic / qianwen / zhipu
+  provider: "qianwen"
+  name: "qwen-vl-max"
+  api_key_env: "DASHSCOPE_API_KEY"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  temperature: 0.1
+  max_tokens: 4096
+
+vision:
+  provider: "qianwen"
+  name: "qwen-vl-max"
+  api_key_env: "DASHSCOPE_API_KEY"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+browser:
+  headless: false
+  slow_mo: 100
+  viewport:
+    width: 1920
+    height: 1080
+  base_url: "https://example.com"
+
+record:
+  output_dir: "case"
+  vision_describe: true
+  screenshot_per_action: true
+
+langfuse:
+  public_key_env: "LANGFUSE_PUBLIC_KEY"
+  secret_key_env: "LANGFUSE_SECRET_KEY"
+  host: "http://localhost:3000/"
+
+allure:
+  results_dir: "reports/allure-results"
+
+excel:
+  sheet_name: 0
+  mode: "auto"
+  columns:
+    id: "用例描述"          # 用 "用例描述" 当 ID（这个 Excel 没有独立 ID 列）
+    name: "用例描述"
+    steps: "操作步骤"
+    expected: "预期结果"
+    priority: "优先级"
+    tags: "模块"            # 用 "模块" 当标签
+    setup: "前置条件"       # 前置条件步骤列

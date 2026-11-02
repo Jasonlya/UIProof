@@ -1,0 +1,12 @@
+{
+  "name": "ui-perf-controller",
+  "version": "1.0.0",
+  "description": "UI 自动化性能控制服务（连接已有 Chrome，控制 Tracing）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.0.0"
+  }
+}

@@ -1,0 +1,31 @@
+# ---------------------------------------------------------------------------
+# 可选 / 遗留：独立 Node 服务（远程调试端口 + puppeteer-core）
+# 当前 ui-automation-plugin 默认在扩展内用 chrome.debugger 采集，无需本服务。
+# 说明见同目录 README.md 与仓库 docs/runtime-sequence.md
+# ---------------------------------------------------------------------------
+
+ui-perf-controller 运行依赖说明
+
+1. Node.js 环境
+   - 版本建议：Node.js 18.x 或以上
+
+2. NPM 包依赖（来自 package.json）
+   - puppeteer-core@^23.0.0
+
+3. 安装方式
+   - 在 perf-controller 目录下执行：
+     - npm install
+   - 或仅按照依赖手动安装：
+     - npm install puppeteer-core@^23.0.0
+
+4. 运行命令
+   - 在 perf-controller 目录下：
+     - npm start
+   - 或：
+     - node server.js
+
+5. 其它说明
+   - 无额外 NPM 依赖：只依赖 Node 内置模块 http、url 和 puppeteer-core。
+   - 需要一个已启动的 Chrome / Chromium，并开启远程调试端口，例如：
+     - chrome --remote-debugging-port=9222
+

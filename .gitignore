@@ -1,0 +1,61 @@
+# macOS
+.DS_Store
+
+# Python 通用
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+venv/
+.venv/
+server/venv/
+
+# 环境变量与本地配置
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.local
+
+# 本次分析/生成产物（保留在本地，不发布到代码仓库）
+outputs/
+
+# Flask/SQLite 本地数据库与实例文件
+server/instance/*.db
+server/instance/*.sqlite
+server/instance/*.sqlite3
+
+# 日志
+*.log
+server/logs/
+
+# 前端/JS 常见产物
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+build/
+coverage/
+*.map
+
+# IDE/编辑器
+.vscode/
+.idea/
+
+# AI Agent 集成产物
+screenshots/
+traces/
+reports/allure-results/
+logs/
+server/instance/*.db
+*.sqlite
+*.sqlite3
