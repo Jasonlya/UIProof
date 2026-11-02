@@ -30,8 +30,11 @@ outputs/
 
 # Flask/SQLite 本地数据库与实例文件
 server/instance/*.db
+server/instance/*.db-*
 server/instance/*.sqlite
+server/instance/*.sqlite-*
 server/instance/*.sqlite3
+server/instance/*.sqlite3-*
 
 # 日志
 *.log

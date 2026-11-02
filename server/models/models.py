@@ -1,9 +1,27 @@
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 from datetime import datetime
 import uuid
 import json
+import sqlite3
 
 db = SQLAlchemy()
+
+
+@event.listens_for(Engine, "connect")
+def configure_sqlite_connection(dbapi_connection, _connection_record):
+    """启用 WAL、外键和等待超时，提升单机并发读写稳定性。"""
+    if not isinstance(dbapi_connection, sqlite3.Connection):
+        return
+
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+    finally:
+        cursor.close()
 
 
 class TestCase(db.Model):

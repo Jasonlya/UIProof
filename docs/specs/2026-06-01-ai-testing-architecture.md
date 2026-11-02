@@ -39,7 +39,7 @@ Flask 后端 (port 5001, 统一服务)
 └── mcp/
     └── playwright_client.py
 
-MySQL / SQLite
+SQLite
 ├── TestCase (steps JSON 格式)
 ├── Folder
 ├── ExecutionLog (SSE 进度数据)

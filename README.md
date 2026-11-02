@@ -22,7 +22,7 @@
 │  └───────┬────────┘  └───────┬────────┘  └─────┬─────┘  │
 │          │                   │                  │        │
 │  ┌───────▼───────────────────▼──────────────────▼─────┐  │
-│  │              MySQL / SQLite 数据库                  │  │
+│  │                    SQLite 数据库                    │  │
 │  └────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -155,8 +155,10 @@ playwright install chromium
 cp .env.example server/.env
 ```
 
-默认使用 `server/instance/automation_cases.db`（SQLite），无需额外启动数据库。
-生产环境可通过 `DATABASE_URL` 指向 MySQL/PostgreSQL，并通过 `MYSQL_*` 配置迁移脚本。
+数据库固定使用 SQLite，默认路径为 `server/instance/automation_cases.db`，无需安装或启动数据库服务。
+如需调整数据文件位置，可设置 `SQLITE_DB_PATH`；相对路径以 `server/` 目录为基准。
+
+历史 MySQL 迁移脚本已归档到 `backup/mysql-migration/`，不属于运行时依赖。
 
 模型与 Langfuse 凭据通过环境变量提供：
 
@@ -238,13 +240,13 @@ Chrome 扩展实时更新进度面板      自动定位替代元素继续执行
 | 浏览器自动化 | Playwright (Chromium) |
 | 前端 | Chrome Extension Manifest V3 |
 | LLM | 千问 VL-Max / GPT-4o / Claude (可配置) |
-| 数据库 | MySQL (主) / SQLite (备) |
+| 数据库 | SQLite (WAL 模式) |
 | 报告 | Allure JSON + Langfuse 追踪 |
 
 ## 环境变量
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `DATABASE_URL` | 数据库连接串 | MySQL |
+| `SQLITE_DB_PATH` | SQLite 数据文件路径 | `server/instance/automation_cases.db` |
 | `AGENT_CONFIG` | AI 配置文件路径 | `server/agent_config.yaml` |
 | `DASHSCOPE_API_KEY` | 千问 API Key (替代配置文件) | — |

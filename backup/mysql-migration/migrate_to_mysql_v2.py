@@ -5,12 +5,16 @@
 
 import sqlite3
 import os
+from pathlib import Path
 
 import pymysql
 from datetime import datetime
 
-# SQLite数据库路径
-SQLITE_DB_PATH = 'instance/automation_cases.db'
+# 归档脚本位于 backup/mysql-migration/，默认读取仓库中的 SQLite 数据文件
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SQLITE_DB_PATH = Path(
+    os.environ.get('SQLITE_DB_PATH', REPO_ROOT / 'server' / 'instance' / 'automation_cases.db')
+).expanduser().resolve()
 
 # MySQL连接配置
 MYSQL_CONFIG = {
@@ -24,7 +28,7 @@ MYSQL_CONFIG = {
 
 def connect_sqlite():
     """连接SQLite数据库"""
-    return sqlite3.connect(SQLITE_DB_PATH)
+    return sqlite3.connect(str(SQLITE_DB_PATH))
 
 def connect_mysql():
     """连接MySQL数据库"""

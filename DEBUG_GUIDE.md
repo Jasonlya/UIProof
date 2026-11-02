@@ -319,7 +319,7 @@ chrome.storage.local.get(null, (items) => {
 
 2. **检查数据库**
 ```sql
--- 在 MySQL 中
+-- SQLite：sqlite3 server/instance/automation_cases.db
 SELECT * FROM test_case;
 SELECT * FROM folders;
 ```
