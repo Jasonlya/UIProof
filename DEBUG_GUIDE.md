@@ -96,12 +96,12 @@ chrome.storage.local.clear(() => {
 **在侧边栏控制台：**
 ```javascript
 // 测试API连接
-fetch('http://localhost:5000/api/health')
+fetch('http://localhost:5001/api/health')
   .then(r => r.json())
   .then(data => console.log('健康检查:', data))
 
 // 查看用例列表
-fetch('http://localhost:5000/api/cases')
+fetch('http://localhost:5001/api/cases')
   .then(r => r.json())
   .then(data => console.log('用例列表:', data))
 ```
@@ -116,7 +116,7 @@ fetch('http://localhost:5000/api/cases')
 ```bash
 cd server
 python app.py
-# 默认运行在 http://localhost:5000，开启 debug=True
+# 默认运行在 http://localhost:5001；设置 FLASK_DEBUG=1 可开启调试模式
 ```
 
 **方法2：使用启动脚本**
@@ -154,22 +154,22 @@ cd server
 **使用 curl 测试：**
 ```bash
 # 健康检查
-curl http://localhost:5000/api/health
+curl http://localhost:5001/api/health
 
 # 获取用例列表
-curl http://localhost:5000/api/cases
+curl http://localhost:5001/api/cases
 
 # 创建用例
-curl -X POST http://localhost:5000/api/cases \
+curl -X POST http://localhost:5001/api/cases \
   -H "Content-Type: application/json" \
   -d '{"name":"测试用例","description":"测试","steps":"[]"}'
 
 # 获取文件夹列表
-curl http://localhost:5000/api/folders
+curl http://localhost:5001/api/folders
 ```
 
 **使用浏览器测试：**
-- 直接访问：http://localhost:5000/api/health
+- 直接访问：http://localhost:5001/api/health
 - 使用 Postman 或类似工具
 
 ### 5. 数据库调试
@@ -277,10 +277,10 @@ document.querySelector('#your-selector')
 1. **检查服务是否运行**
 ```bash
 # 检查端口是否被占用
-lsof -i :5000
+lsof -i :5001
 
 # 检查服务是否响应
-curl http://localhost:5000/api/health
+curl http://localhost:5001/api/health
 ```
 
 2. **检查 CORS 配置**

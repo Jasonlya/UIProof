@@ -725,6 +725,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       sendResponse({ success: true });
       break;
+
+    case 'stepEnhanced':
+      console.log('🤖 收到步骤增强信息:', message);
+      if (recordingManager && typeof recordingManager.updateStepEnhancement === 'function') {
+        recordingManager.updateStepEnhancement(message);
+      }
+      sendResponse({ success: true });
+      break;
       
     case 'recordingStarted':
       console.log('🎬 录制已开始');

@@ -1,36 +1,49 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 服务端启动脚本
-# 功能：启动Flask服务端，输出日志到文件
-
-# 设置脚本目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# 设置日志文件路径
-LOG_FILE="logs/app.log"
-ERROR_LOG_FILE="logs/error.log"
+PORT="${PORT:-5001}"
+LOG_DIR="$SCRIPT_DIR/logs"
+PID_DIR="$SCRIPT_DIR/.run"
+PID_FILE="$PID_DIR/server.pid"
 
-# 创建日志目录
-mkdir -p logs
+mkdir -p "$LOG_DIR" "$PID_DIR"
 
-# 激活虚拟环境
-source venv/bin/activate
-
-# 检查端口是否被占用
-if lsof -Pi :5000 -sTCP:LISTEN -t >/dev/null ; then
-    echo "端口5000已被占用，正在停止现有进程..."
-    pkill -f "python3 app.py"
-    sleep 2
+if [[ -f "$PID_FILE" ]]; then
+  EXISTING_PID="$(cat "$PID_FILE")"
+  if kill -0 "$EXISTING_PID" 2>/dev/null; then
+    echo "服务端已在运行 (PID $EXISTING_PID): http://localhost:$PORT"
+    exit 0
+  fi
+  rm -f "$PID_FILE"
 fi
 
-# 启动服务端并输出日志
-echo "启动服务端..."
-echo "日志文件: $LOG_FILE"
-echo "错误日志: $ERROR_LOG_FILE"
-echo "服务地址: http://localhost:5000"
-echo "按 Ctrl+C 停止服务"
-echo "----------------------------------------"
+if lsof -Pi ":$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
+  echo "端口 $PORT 已被占用，请先释放端口或设置 PORT 环境变量"
+  exit 1
+fi
 
-# 启动Flask应用，同时输出到控制台和日志文件
-python3 app.py 2>&1 | tee -a "$LOG_FILE" 2> "$ERROR_LOG_FILE"
+if [[ -f "$SCRIPT_DIR/venv/bin/activate" ]]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/venv/bin/activate"
+fi
+
+echo "启动服务端..."
+echo "日志文件: $LOG_DIR/app.log"
+echo "服务地址: http://localhost:$PORT"
+
+PORT="$PORT" nohup python3 app.py >>"$LOG_DIR/app.log" 2>&1 &
+SERVER_PID=$!
+echo "$SERVER_PID" >"$PID_FILE"
+
+sleep 1
+if kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "服务端已启动 (PID $SERVER_PID)"
+else
+  rm -f "$PID_FILE"
+  echo "启动失败，最近日志："
+  tail -n 30 "$LOG_DIR/app.log" || true
+  exit 1
+fi

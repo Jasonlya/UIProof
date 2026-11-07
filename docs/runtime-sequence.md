@@ -45,13 +45,13 @@
   summary { totalEvents } ----> Popup 性能结果面板 (_appendPerfResultLine)
         |
         v
-(用例执行成功后) POST /api/cases/:id/execute
+POST /api/runs 创建运行 → 每步/整条用例追加 perf-segments → POST /api/runs/:id/finish
         |
         v
 [Flask]
         |
         v
-(规划中：/api/performance/baselines & /runs 等)
+Run 与性能分段持久化到 SQLite；GET /api/runs/:id/perf 可回读
 ```
 
 ---
@@ -67,7 +67,7 @@
 [侧边栏 CaseManager._performBatchExecute]
         |
         | 对每个 caseId：拉取详情、解析 steps
-        | 若 enablePerfOnExecute → _executeCaseStepsWithPerfPerStep
+        | RunCoordinator.runCase(perfMode: 'step')
         |
         | 对当前用例每一步：
         |   sendMessage(perfTracingStart, tabId)
@@ -92,7 +92,7 @@
 [_appendPerfResultLine(用例名, 步骤 N, totalEvents)]
         |
         v
-(该用例全部步骤完成后) POST /api/cases/:id/execute
+RunCoordinator.finishRun('passed' | 'failed' | 'error')
         |
         v
 (下一用例重复；用例间隔约 1s)
@@ -108,7 +108,7 @@
 [用户勾选 1..N 用例 + 「性能测试」+ 选「整个用例」]
         |
         v
-[CaseManager._executeCaseWithPerfWholeCase（每个用例各调用一次）]
+[CaseManager → RunCoordinator.runCase(perfMode: 'case')]
         |
         | sendMessage(perfTracingStart, tabId)
         v
@@ -126,7 +126,7 @@
 [_appendPerfResultLine(用例名, 整条, totalEvents)]
         |
         v
-POST /api/cases/:id/execute
+RunCoordinator.finishRun('passed' | 'failed' | 'error')
 ```
 
 ---
@@ -202,7 +202,9 @@ sequenceDiagram
             Popup->>Storage: get(uiap_execution_result)
         end
 
-        Popup->>Flask: POST /api/cases/:id/execute
+        Popup->>Flask: POST /api/runs (创建 Run)
+        Flask-->>Popup: { run_id, status: running }
+        Popup->>Flask: POST /api/runs/:run_id/finish
         Popup->>Popup: 成功/失败计数
     end
 
@@ -214,7 +216,7 @@ sequenceDiagram
 
 ## 3. 执行用例（带性能采集，可多选）
 
-勾选 **「性能测试」** 时，`perfEnabled === true`，**不再**要求仅选中一条用例；对每个选中用例按维度（单步 / 整条）调用 `_executeCaseStepsWithPerfPerStep` 或 `_executeCaseWithPerfWholeCase`。Tracing 经 **Background** 内 `perfTracingStart` / `perfTracingStop` 消息驱动，作用于 **`tabId`（当前活动标签页）**。
+勾选 **「性能测试」** 时，`perfEnabled === true`，**不再**要求仅选中一条用例；对每个选中用例按维度（单步 / 整条）交给 `RunCoordinator.runCase({ perfMode: 'step' | 'case' })`。每段 Tracing 结束后通过 `POST /api/runs/:run_id/perf-segments` 持久化，最终 `POST /api/runs/:run_id/finish` 写入终态并更新用例统计。Tracing 经 **Background** 内 `perfTracingStart` / `perfTracingStop` 消息驱动，作用于 **`tabId`（当前活动标签页）**。
 
 ```mermaid
 sequenceDiagram
@@ -264,7 +266,7 @@ sequenceDiagram
             end
         end
 
-        Popup->>Flask: POST /api/cases/:id/execute
+        Popup->>Flask: POST /api/runs/:run_id/finish
     end
 
     Popup-->>User: 批量结果弹窗 + 性能面板多行结果

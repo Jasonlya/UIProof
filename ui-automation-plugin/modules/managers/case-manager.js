@@ -8,6 +8,9 @@ import {
   extensionPerfTracingStop,
 } from '../perf/perf-client.js';
 import { generatePerfReportHtml } from '../perf/perf-report.js';
+import { PerfSession } from '../perf/perf-session.js';
+import { RunClient } from '../runs/run-client.js';
+import { RunCoordinator } from '../runs/run-coordinator.js';
 
 class CaseManager {
   constructor() {
@@ -24,6 +27,10 @@ class CaseManager {
     /** 批量性能执行时收集各段 summary，用于 HTML 报告 */
     this._perfReportSegments = [];
     this._perfReportCollecting = false;
+    /** 本次批量执行产生的 Run 结果（含持久化后的性能分段） */
+    this._runResults = [];
+    /** @type {RunCoordinator|null} */
+    this._activeRunCoordinator = null;
   }
 
   /**
@@ -208,6 +215,19 @@ class CaseManager {
       const data = await response.json();
       
       if (response.ok) {
+        const expectedStepCount = this.recordingManager
+          ? this.recordingManager.getRecordedSteps().length
+          : 0;
+        const savedStepCount = data.steps_count ?? data.case?.steps_count;
+        if (typeof savedStepCount === 'number' && savedStepCount !== expectedStepCount) {
+          console.error('❌ 步骤保存数量不一致:', { expectedStepCount, savedStepCount });
+          this.setStatus(
+            `用例已保存，但步骤数量不一致（本地 ${expectedStepCount} 步，服务端 ${savedStepCount} 步），请检查后重试`,
+            false
+          );
+          return;
+        }
+
         console.log('💾 用例保存成功:', data);
         this.setStatus('用例保存成功', true);
         
@@ -340,14 +360,13 @@ class CaseManager {
       const perfEnabled = !!this.enablePerfOnExecute;
       const perfMode = this.perfMode || 'step'; // 'step' | 'case'
       this._perfReportCollecting = perfEnabled;
-      if (perfEnabled) {
-        this._perfReportSegments = [];
-        if (this.lastPerfReportBlobUrl) {
-          try {
-            URL.revokeObjectURL(this.lastPerfReportBlobUrl);
-          } catch (_) {}
-          this.lastPerfReportBlobUrl = null;
-        }
+      this._perfReportSegments = [];
+      this._runResults = [];
+      if (this.lastPerfReportBlobUrl) {
+        try {
+          URL.revokeObjectURL(this.lastPerfReportBlobUrl);
+        } catch (_) {}
+        this.lastPerfReportBlobUrl = null;
       }
       let successCount = 0;
       let failCount = 0;
@@ -394,108 +413,30 @@ class CaseManager {
             continue;
           }
 
-          // 开启性能测试时：每条用例单独按维度采集（整条用例 / 单步），可多选批量依次执行
-          if (perfEnabled) {
-            try {
-              if (perfMode === 'case') {
-                await this._executeCaseWithPerfWholeCase(caseItem, steps);
-                console.log(`✅ 用例执行成功(整条用例性能采集): ${caseItem.name}`);
-              } else {
-                await this._executeCaseStepsWithPerfPerStep(caseItem, steps);
-                console.log(`✅ 用例执行成功(按单步性能采集): ${caseItem.name}`);
-              }
-              successCount++;
-              await fetch(`${this.SERVER_URL}/api/cases/${caseId}/execute`, { method: 'POST' });
-            } catch (error) {
-              failCount++;
-              failedCases.push({ name: caseItem.name, reason: error.message || '执行异常(性能模式)' });
-              console.error(`❌ 用例执行失败(性能模式): ${caseItem.name}`, error);
-            }
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            continue;
-          }
-          
           const tabId = await this.getActivePageTabId();
           if (!tabId) {
             throw new Error('无法获取当前标签页');
           }
-          
-          // 清理之前的执行状态，确保每次执行都是干净的开始
-          try {
-            const previousState = await chrome.storage.local.get('uiap_execution_state');
-            if (previousState.uiap_execution_state && previousState.uiap_execution_state.isExecuting) {
-              console.log('⚠️ 检测到之前的执行状态，正在清理...');
-              await chrome.runtime.sendMessage({ type: 'stopExecution' });
-              await chrome.storage.local.remove('uiap_execution_state');
-              await chrome.storage.local.remove('uiap_execution_result');
-              // 等待一下确保状态清理完成
-              await new Promise(resolve => setTimeout(resolve, 200));
-            }
-          } catch (cleanupError) {
-            console.warn('清理执行状态失败:', cleanupError);
-            // 继续执行，不阻塞
-          }
-          
-          const response = await chrome.runtime.sendMessage({
-            type: 'startExecution',
-            steps: steps,
-            intervalMs: 500,
-            tabId: tabId
+
+          const runMode = perfEnabled ? (perfMode === 'case' ? 'case' : 'step') : 'none';
+          const coordinator = this._createRunCoordinator(tabId);
+          const runResult = await coordinator.runCase({
+            caseItem,
+            steps,
+            perfMode: runMode,
           });
-          
-          if (response && response.ok) {
-            // 等待执行完成
-            let executionCompleted = false;
-            let executionResult = null;
-            const maxWaitTime = 300000; // 最多等待5分钟
-            const startTime = Date.now();
-            
-            while (!executionCompleted && (Date.now() - startTime) < maxWaitTime) {
-              await new Promise(resolve => setTimeout(resolve, 500));
-              
-              const state = await chrome.storage.local.get('uiap_execution_state');
-              if (!state.uiap_execution_state || !state.uiap_execution_state.isExecuting) {
-                executionCompleted = true;
-                
-                // 获取执行结果
-                const resultData = await chrome.storage.local.get('uiap_execution_result');
-                executionResult = resultData.uiap_execution_result;
-                
-                // 清理执行状态和结果数据
-                await chrome.storage.local.remove('uiap_execution_state');
-                await chrome.storage.local.remove('uiap_execution_result');
-                break;
-              }
-            }
-            
-            // 如果超时，确保清理执行状态
-            if (!executionCompleted) {
-              console.warn('⚠️ 执行等待超时，清理执行状态');
-              try {
-                await chrome.runtime.sendMessage({ type: 'stopExecution' });
-                await chrome.storage.local.remove('uiap_execution_state');
-                await chrome.storage.local.remove('uiap_execution_result');
-              } catch (cleanupError) {
-                console.warn('清理执行状态失败:', cleanupError);
-              }
-            }
-            
-            if (executionResult && !executionResult.success) {
-              failCount++;
-              failedCases.push({ name: caseItem.name, reason: `执行失败: ${executionResult.failCount}个步骤失败` });
-              console.error(`❌ 用例执行失败: ${caseItem.name}`);
-            } else {
-              successCount++;
-              console.log(`✅ 用例执行成功: ${caseItem.name}`);
-              
-              await fetch(`${this.SERVER_URL}/api/cases/${caseId}/execute`, {
-                method: 'POST'
-              });
-            }
+          this._runResults.push(runResult);
+
+          if (runResult.status === 'passed') {
+            successCount++;
+            console.log(`✅ 用例执行成功: ${caseItem.name} (run ${runResult.runId})`);
           } else {
             failCount++;
-            failedCases.push({ name: caseItem.name, reason: response?.message || '启动执行失败' });
-            console.error(`❌ 用例执行失败: ${caseItem.name}`, response?.message);
+            failedCases.push({
+              name: caseItem.name,
+              reason: `执行失败: ${runResult.status}`,
+            });
+            console.error(`❌ 用例执行失败: ${caseItem.name} (run ${runResult.runId})`);
           }
           
           await new Promise(resolve => setTimeout(resolve, 1000));
@@ -507,6 +448,12 @@ class CaseManager {
       }
 
       this._perfReportCollecting = false;
+      this._perfReportSegments = this._runResults.flatMap((runResult) =>
+        (runResult.segments || []).map((segment) => ({
+          heading: segment.heading,
+          summary: segment.summary,
+        }))
+      );
       if (
         perfEnabled &&
         this._perfReportSegments &&
@@ -585,222 +532,145 @@ class CaseManager {
   }
   
   /**
-   * 按「单步维度」执行：每步通过扩展内 perf 模块（CDP Tracing.start 轻量类别，start/stop 区间）
+   * 兼容旧调用：按单步维度执行，返回已持久化的 Run 结果。
    */
   async _executeCaseStepsWithPerfPerStep(caseItem, steps) {
     const tabId = await this.getActivePageTabId();
     if (!tabId) {
       throw new Error('无法获取当前标签页');
     }
-
-    for (let idx = 0; idx < steps.length; idx++) {
-      const step = steps[idx];
-      let perfActive = false;
-
-      try {
-        try {
-          const startData = await extensionPerfTracingStart(tabId);
-          if (startData && startData.ok) {
-            perfActive = true;
-            console.log(`📊 第 ${idx + 1} 步性能 tracing 已启动`);
-          } else {
-            console.warn(`⚠️ 第 ${idx + 1} 步启动性能 tracing 失败:`, startData?.error || startData);
-          }
-        } catch (e) {
-          console.warn(`⚠️ 第 ${idx + 1} 步调用性能模块失败:`, e);
-        }
-
-        try {
-          const previousState = await chrome.storage.local.get('uiap_execution_state');
-          if (previousState.uiap_execution_state && previousState.uiap_execution_state.isExecuting) {
-            console.log('⚠️ 检测到之前的执行状态，正在清理(单步模式)...');
-            await chrome.runtime.sendMessage({ type: 'stopExecution' });
-            await chrome.storage.local.remove('uiap_execution_state');
-            await chrome.storage.local.remove('uiap_execution_result');
-            await new Promise(resolve => setTimeout(resolve, 200));
-          }
-        } catch (cleanupError) {
-          console.warn('清理执行状态失败(单步模式):', cleanupError);
-        }
-
-        const response = await chrome.runtime.sendMessage({
-          type: 'startExecution',
-          steps: [step],
-          intervalMs: 0,
-          tabId: tabId
-        });
-
-        if (response && response.ok) {
-          let executionCompleted = false;
-          let executionResult = null;
-          const maxWaitTime = 60000;
-          const startTime = Date.now();
-
-          while (!executionCompleted && (Date.now() - startTime) < maxWaitTime) {
-            await new Promise(resolve => setTimeout(resolve, 300));
-
-            const state = await chrome.storage.local.get('uiap_execution_state');
-            if (!state.uiap_execution_state || !state.uiap_execution_state.isExecuting) {
-              executionCompleted = true;
-
-              const resultData = await chrome.storage.local.get('uiap_execution_result');
-              executionResult = resultData.uiap_execution_result;
-
-              await chrome.storage.local.remove('uiap_execution_state');
-              await chrome.storage.local.remove('uiap_execution_result');
-              break;
-            }
-          }
-
-          if (!executionCompleted) {
-            console.warn('⚠️ 单步执行等待超时，清理执行状态');
-            try {
-              await chrome.runtime.sendMessage({ type: 'stopExecution' });
-              await chrome.storage.local.remove('uiap_execution_state');
-              await chrome.storage.local.remove('uiap_execution_result');
-            } catch (cleanupError) {
-              console.warn('清理执行状态失败(单步超时):', cleanupError);
-            }
-          }
-
-          if (executionResult && !executionResult.success) {
-            console.error(`❌ 第 ${idx + 1} 步执行失败`, executionResult);
-            throw new Error(`第 ${idx + 1} 步执行失败`);
-          } else {
-            console.log(`✅ 第 ${idx + 1} 步执行成功`);
-          }
-        } else {
-          console.error(`❌ 第 ${idx + 1} 步启动执行失败`, response?.message);
-          throw new Error(`第 ${idx + 1} 步启动执行失败`);
-        }
-      } finally {
-        if (perfActive) {
-          try {
-            const data = await extensionPerfTracingStop(tabId);
-            if (data && data.ok) {
-              const summary = data.summary || {};
-              console.log(`📊 第 ${idx + 1} 步性能 summary:`, summary);
-              this.appendPerfResultSummary(
-                summary,
-                `用例「${caseItem.name}」步骤 ${idx + 1}`
-              );
-            } else {
-              console.warn(`⚠️ 第 ${idx + 1} 步停止性能 tracing 失败:`, data?.error || data);
-            }
-          } catch (e) {
-            console.warn(`⚠️ 第 ${idx + 1} 步停止性能 tracing 失败:`, e);
-          }
-        }
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
+    const result = await this._createRunCoordinator(tabId).runCase({
+      caseItem,
+      steps,
+      perfMode: 'step',
+    });
+    this._runResults.push(result);
+    this._renderRunSegments(result);
+    return result;
   }
 
   /**
-   * 按「整条用例」维度：一次采集区间包住全部步骤（扩展内 perf 模块）
+   * 兼容旧调用：按整条用例维度执行，返回已持久化的 Run 结果。
    */
   async _executeCaseWithPerfWholeCase(caseItem, steps) {
     const tabId = await this.getActivePageTabId();
     if (!tabId) {
       throw new Error('无法获取当前标签页');
     }
+    const result = await this._createRunCoordinator(tabId).runCase({
+      caseItem,
+      steps,
+      perfMode: 'case',
+    });
+    this._runResults.push(result);
+    this._renderRunSegments(result);
+    return result;
+  }
 
-    let perfActive = false;
-    try {
-      try {
-        const startData = await extensionPerfTracingStart(tabId);
-        if (startData && startData.ok) {
-          perfActive = true;
-            console.log('📊 整条用例性能 tracing 已启动');
-        } else {
-            console.warn('⚠️ 整条用例启动性能 tracing 失败:', startData?.error || startData);
-        }
-      } catch (e) {
-        console.warn('⚠️ 整条用例调用性能模块失败:', e);
-      }
+  /**
+   * 构造 Run 协调器：执行动作仍走扩展 background，性能采样走 CDP。
+   */
+  _createRunCoordinator(tabId) {
+    const client = new RunClient({
+      baseUrl: this.SERVER_URL,
+      clientVersion: '0.3.0',
+    });
+    const coordinator = new RunCoordinator({
+      client,
+      driver: {
+        executeStep: (step, index) => this._executeSingleStepViaBackground(tabId, step, index),
+        stop: () => chrome.runtime.sendMessage({ type: 'stopExecution' }),
+      },
+      perfSession: new PerfSession({
+        start: () => extensionPerfTracingStart(tabId),
+        stop: () => extensionPerfTracingStop(tabId),
+      }),
+      clientVersion: '0.3.0',
+    });
+    this._activeRunCoordinator = coordinator;
+    return coordinator;
+  }
 
-      try {
-        const previousState = await chrome.storage.local.get('uiap_execution_state');
-        if (previousState.uiap_execution_state && previousState.uiap_execution_state.isExecuting) {
-          console.log('⚠️ 检测到之前的执行状态，正在清理(整条用例性能模式)...');
-          await chrome.runtime.sendMessage({ type: 'stopExecution' });
-          await chrome.storage.local.remove('uiap_execution_state');
-          await chrome.storage.local.remove('uiap_execution_result');
-          await new Promise(resolve => setTimeout(resolve, 200));
-        }
-      } catch (cleanupError) {
-        console.warn('清理执行状态失败(整条用例性能模式):', cleanupError);
-      }
-
-      const response = await chrome.runtime.sendMessage({
-        type: 'startExecution',
-        steps: steps,
-        intervalMs: 500,
-        tabId: tabId
-      });
-
-      if (response && response.ok) {
-        let executionCompleted = false;
-        let executionResult = null;
-        const maxWaitTime = 300000;
-        const startTime = Date.now();
-
-        while (!executionCompleted && (Date.now() - startTime) < maxWaitTime) {
-          await new Promise(resolve => setTimeout(resolve, 500));
-
-          const state = await chrome.storage.local.get('uiap_execution_state');
-          if (!state.uiap_execution_state || !state.uiap_execution_state.isExecuting) {
-            executionCompleted = true;
-
-            const resultData = await chrome.storage.local.get('uiap_execution_result');
-            executionResult = resultData.uiap_execution_result;
-
-            await chrome.storage.local.remove('uiap_execution_state');
-            await chrome.storage.local.remove('uiap_execution_result');
-            break;
-          }
-        }
-
-        if (!executionCompleted) {
-          console.warn('⚠️ 整条用例执行等待超时，清理执行状态');
-          try {
-            await chrome.runtime.sendMessage({ type: 'stopExecution' });
-            await chrome.storage.local.remove('uiap_execution_state');
-            await chrome.storage.local.remove('uiap_execution_result');
-          } catch (cleanupError) {
-            console.warn('清理执行状态失败(整条用例超时):', cleanupError);
-          }
-        }
-
-        if (executionResult && !executionResult.success) {
-          console.error('❌ 整条用例执行失败(性能模式)', executionResult);
-          throw new Error('整条用例执行失败');
-        } else {
-          console.log('✅ 整条用例执行成功(性能模式)');
-        }
-      } else {
-        console.error('❌ 整条用例启动执行失败(性能模式)', response?.message);
-        throw new Error('整条用例启动执行失败');
-      }
-    } finally {
-      if (perfActive) {
-        try {
-          const data = await extensionPerfTracingStop(tabId);
-          if (data && data.ok) {
-            const summary = data.summary || {};
-            console.log('📊 整条用例性能 summary:', summary);
-            this.appendPerfResultSummary(summary, `用例「${caseItem.name}」整条用例`);
-          } else {
-            console.warn('⚠️ 整条用例停止性能 tracing 失败:', data?.error || data);
-          }
-        } catch (e) {
-          console.warn('⚠️ 整条用例停止性能 tracing 失败:', e);
-        }
-      }
+  _renderRunSegments(runResult) {
+    for (const segment of runResult.segments || []) {
+      this.appendPerfResultSummary(segment.summary, segment.heading);
     }
   }
-  
+
+  /**
+   * 通过 background 执行单个步骤，并统一归一化结果。
+   */
+  async _executeSingleStepViaBackground(tabId, step, stepIndex = 0) {
+    try {
+      const previousState = await chrome.storage.local.get('uiap_execution_state');
+      if (previousState.uiap_execution_state?.isExecuting) {
+        await chrome.runtime.sendMessage({ type: 'stopExecution' });
+        await chrome.storage.local.remove('uiap_execution_state');
+        await chrome.storage.local.remove('uiap_execution_result');
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    } catch (cleanupError) {
+      console.warn('清理执行状态失败(单步 Run):', cleanupError);
+    }
+
+    const response = await chrome.runtime.sendMessage({
+      type: 'startExecution',
+      steps: [step],
+      intervalMs: 0,
+      tabId,
+    });
+    if (!response?.ok) {
+      throw new Error(response?.message || `第 ${stepIndex + 1} 步启动执行失败`);
+    }
+
+    let executionResult;
+    try {
+      executionResult = await this._waitForExecutionResult(60000);
+    } catch (error) {
+      try {
+        await chrome.runtime.sendMessage({ type: 'stopExecution' });
+      } catch (_) {}
+      await chrome.storage.local.remove('uiap_execution_state');
+      await chrome.storage.local.remove('uiap_execution_result');
+      throw error;
+    }
+
+    if (executionResult && executionResult.success === false) {
+      return {
+        status: 'failed',
+        stepIndex,
+        message: `${executionResult.failCount || 0} 个步骤失败`,
+        result: executionResult,
+      };
+    }
+    return { status: 'passed', stepIndex };
+  }
+
+  async _waitForExecutionResult(timeoutMs = 60000) {
+    const startTime = Date.now();
+    while ((Date.now() - startTime) < timeoutMs) {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const state = await chrome.storage.local.get('uiap_execution_state');
+      if (!state.uiap_execution_state || !state.uiap_execution_state.isExecuting) {
+        const resultData = await chrome.storage.local.get('uiap_execution_result');
+        const result = resultData.uiap_execution_result || null;
+        await chrome.storage.local.remove('uiap_execution_state');
+        await chrome.storage.local.remove('uiap_execution_result');
+        return result;
+      }
+    }
+    throw new Error('执行等待超时');
+  }
+
+  async stopActiveRun() {
+    if (!this._activeRunCoordinator) {
+      return null;
+    }
+    const result = await this._activeRunCoordinator.stop();
+    this._activeRunCoordinator = null;
+    return result;
+  }
+
   /**
    * 追加一行性能结果到插件 UI 面板（纯文本）
    */
@@ -981,17 +851,6 @@ class CaseManager {
       block.appendChild(table);
       container.appendChild(block);
       container.scrollTop = container.scrollHeight;
-
-      if (this._perfReportCollecting && summary) {
-        try {
-          this._perfReportSegments.push({
-            heading: headingText || '性能采集',
-            summary: JSON.parse(JSON.stringify(summary)),
-          });
-        } catch (_) {
-          this._perfReportSegments.push({ heading: headingText || '性能采集', summary: { ...summary } });
-        }
-      }
     } catch (e) {
       console.warn('追加性能摘要失败:', e);
     }

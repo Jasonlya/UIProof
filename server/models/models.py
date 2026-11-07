@@ -113,6 +113,23 @@ class ExecutionLog(db.Model):
     video_path = db.Column(db.String(500))  # 录屏文件路径
     final_result = db.Column(db.String(20))  # pass/fail/error/uncertain
 
+    # Run 生命周期与性能采集
+    run_id = db.Column(
+        db.String(64),
+        unique=True,
+        nullable=False,
+        default=lambda: uuid.uuid4().hex,
+    )
+    executor = db.Column(db.String(20), nullable=False, default='extension')
+    perf_mode = db.Column(db.String(20))
+    perf_summary = db.Column(db.Text)
+    steps_total = db.Column(db.Integer, default=0)
+    steps_passed = db.Column(db.Integer, default=0)
+    steps_failed = db.Column(db.Integer, default=0)
+    client_version = db.Column(db.String(40))
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    metadata_json = db.Column(db.Text)
+
     def get_steps_result(self) -> list:
         if not self.steps_result:
             return []
@@ -141,6 +158,46 @@ class ExecutionLog(db.Model):
             elif isinstance(u, dict):
                 data.append(u)
         self.llm_usage = json.dumps(data, ensure_ascii=False)
+
+    def get_perf_summary(self) -> dict:
+        if not self.perf_summary:
+            return {}
+        try:
+            return json.loads(self.perf_summary)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    def set_perf_summary(self, summary: dict):
+        self.perf_summary = json.dumps(summary or {}, ensure_ascii=False)
+
+
+class RunPerfSegment(db.Model):
+    """Run 的性能采集分段，step 维度或整条用例维度。"""
+
+    __tablename__ = 'run_perf_segment'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.String(64), nullable=False, index=True)
+    segment_index = db.Column(db.Integer, nullable=False)
+    scope = db.Column(db.String(10), nullable=False)
+    step_index = db.Column(db.Integer)
+    heading = db.Column(db.String(200))
+    summary_json = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            'run_id',
+            'segment_index',
+            name='uq_run_perf_segment_run_index',
+        ),
+    )
+
+    def get_summary(self) -> dict:
+        try:
+            return json.loads(self.summary_json)
+        except (json.JSONDecodeError, TypeError):
+            return {}
 
 
 class StepSnapshot(db.Model):

@@ -576,11 +576,13 @@ function performClick(target) {
   target.dispatchEvent(new MouseEvent('mouseover', opts));
   target.dispatchEvent(new MouseEvent('mousedown', opts));
   target.dispatchEvent(new MouseEvent('mouseup', opts));
-  target.dispatchEvent(new MouseEvent('click', opts));
 
-  // 对 <button>/<a> 同时调用 .click()（与上面事件互不干扰）
+  // 只触发一次 click：.click() 会派发 click 事件并执行默认行为，
+  // 再 dispatch 一次 click 会导致表单/按钮被点击两次。
   if (typeof target.click === 'function') {
     try { target.click(); } catch (_) {}
+  } else {
+    target.dispatchEvent(new MouseEvent('click', opts));
   }
 }
 
@@ -637,6 +639,120 @@ const _suppressMap = new Map();
 // 输入防抖相关：用于合并连续输入为一条步骤
 const _inputDebounceTimers = new Map(); // selector -> timer
 const _inputPendingSteps = new Map(); // selector -> step index
+const _scrollDebounceTimers = new Map(); // selector -> timer
+const _lastScrollPositions = new Map(); // selector -> { top, left }
+let _recordingCaseId = null;
+
+const STEP_SCHEMA_VERSION = 2;
+const INTERACTIVE_SELECTOR = [
+  'button', 'a[href]', 'input', 'select', 'textarea', 'label',
+  '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="switch"]',
+  '[role="tab"]', '[role="menuitem"]', '[role="radio"]', '[role="option"]',
+  '[contenteditable="true"]'
+].join(',');
+
+function createClientStepId() {
+  return `step_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getElementSnapshot(element) {
+  if (!element || element.nodeType !== 1) return null;
+  let rect = null;
+  try {
+    const r = element.getBoundingClientRect();
+    rect = {
+      x: Math.round(r.x), y: Math.round(r.y),
+      width: Math.round(r.width), height: Math.round(r.height)
+    };
+  } catch (_) {}
+
+  const text = (getDirectText(element) || element.innerText || element.textContent || '').trim();
+  return {
+    tagName: element.tagName || '',
+    id: element.id || '',
+    className: typeof element.className === 'string' ? element.className : '',
+    role: element.getAttribute?.('role') || '',
+    ariaLabel: element.getAttribute?.('aria-label') || '',
+    name: element.getAttribute?.('name') || '',
+    placeholder: element.getAttribute?.('placeholder') || '',
+    inputType: element.type || element.getAttribute?.('type') || '',
+    testId: element.getAttribute?.('data-testid')
+      || element.getAttribute?.('data-cy')
+      || element.getAttribute?.('data-qa')
+      || element.getAttribute?.('data-test')
+      || element.getAttribute?.('data-automation-id')
+      || '',
+    text: text.slice(0, 200),
+    rect
+  };
+}
+
+function resolveActionableTarget(target) {
+  if (!(target instanceof Element)) return target;
+  if (target.matches(INTERACTIVE_SELECTOR)) return target;
+  return target.closest(INTERACTIVE_SELECTOR) || target;
+}
+
+function resolveCheckboxTarget(target) {
+  if (!(target instanceof Element)) return null;
+  if (target.type === 'checkbox') return target;
+
+  const label = target.closest('label');
+  if (label) {
+    if (label.control && label.control.type === 'checkbox') return label.control;
+    const nested = label.querySelector('input[type="checkbox"]');
+    if (nested) return nested;
+  }
+
+  const previous = target.previousElementSibling;
+  if (previous && previous.type === 'checkbox') return previous;
+  return null;
+}
+
+function buildRecordedStep(type, target, extra = {}) {
+  const {
+    selector: explicitSelector,
+    selectorFallbacks: explicitFallbacks,
+    ...rest
+  } = extra;
+  const selector = explicitSelector !== undefined
+    ? explicitSelector
+    : (target ? generateSelector(target) : '');
+  const selectorFallbacks = explicitFallbacks !== undefined
+    ? explicitFallbacks
+    : (target ? generateSelectorFallbacks(target) : []);
+
+  return {
+    schemaVersion: STEP_SCHEMA_VERSION,
+    clientStepId: createClientStepId(),
+    type,
+    selector: selector || '',
+    selectorFallbacks: Array.isArray(selectorFallbacks) ? selectorFallbacks : [],
+    pageUrl: window.location.href,
+    pageTitle: document.title,
+    element: target ? getElementSnapshot(target) : null,
+    ...rest,
+    timestamp: Date.now()
+  };
+}
+
+function emitRecordedStep(step) {
+  recordedSteps.push(step);
+  try { chrome.runtime.sendMessage({ action: 'stepRecorded', step }); } catch (_) {}
+  saveRecordedSteps();
+}
+
+function notifyStepEnhanced(step, patch) {
+  if (!step || !step.clientStepId) return;
+  try {
+    chrome.runtime.sendMessage({
+      action: 'stepEnhanced',
+      clientStepId: step.clientStepId,
+      stepIndex: recordedSteps.indexOf(step),
+      ...patch
+    });
+  } catch (_) {}
+}
 
 // ── AI 增强录制：截图 + Vision Agent 描述 ──
 const SERVER_URL = (typeof APP_CONFIG !== 'undefined' && APP_CONFIG.SERVER_URL)
@@ -666,14 +782,14 @@ function captureViewport() {
   });
 }
 
-/** 调用后端 Vision Agent 获取元素描述 */
-async function getAiDescription(imageBase64) {
-  if (!_aiEnhanceEnabled || !imageBase64) return '';
+/** 调用后端 Vision Agent 获取元素描述（优先使用已保存的 snapshot_id） */
+async function getAiDescription(imageBase64, snapshotId) {
+  if (!_aiEnhanceEnabled || (!imageBase64 && !snapshotId)) return '';
   try {
     const resp = await fetch(`${SERVER_URL}/api/recording/describe`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image: imageBase64 }),
+      body: JSON.stringify(snapshotId ? { snapshot_id: snapshotId } : { image: imageBase64 }),
     });
     if (!resp.ok) return '';
     const data = await resp.json();
@@ -712,25 +828,26 @@ async function enhanceStepWithAi(step, caseId) {
   if (!_aiEnhanceEnabled) return;
   try {
     const screenshot = await captureViewport();
-    if (screenshot) {
-      step.screenshotBase64 = screenshot;
-      // 异步获取 AI 描述（不阻塞录制流程）
-      getAiDescription(screenshot).then(desc => {
-        if (desc) {
-          step.visualDescription = desc;
-          console.log('🤖 AI 描述:', desc);
-          // 通知 popup 更新
-          try {
-            chrome.runtime.sendMessage({
-              action: 'stepEnhanced',
-              stepIndex: recordedSteps.indexOf(step),
-              visualDescription: desc,
-            });
-          } catch (_) {}
-        }
-      });
-      // 异步上传截图到后端
-      uploadScreenshot(screenshot, caseId, recordedSteps.length - 1, 'record');
+    if (!screenshot) return;
+
+    const stepIndex = recordedSteps.indexOf(step);
+    const snapshotId = await uploadScreenshot(
+      screenshot,
+      caseId || _recordingCaseId,
+      stepIndex >= 0 ? stepIndex : 0,
+      'record'
+    );
+
+    if (snapshotId) {
+      step.snapshotId = snapshotId;
+      notifyStepEnhanced(step, { snapshotId });
+    }
+
+    const desc = await getAiDescription(screenshot, snapshotId);
+    if (desc) {
+      step.visualDescription = desc;
+      console.log('🤖 AI 描述:', desc);
+      notifyStepEnhanced(step, { visualDescription: desc });
     }
   } catch (e) {
     console.warn('步骤增强失败:', e);
@@ -859,15 +976,23 @@ async function saveRecordedSteps() {
       stepsSize: JSON.stringify(recordedSteps).length
     });
     
-    // 尝试降级保存：只保存基本信息
+    // 尝试降级保存：保留步骤契约，只裁掉大字段，避免丢失回放所需的 fallback/element。
     try {
-      const simplifiedSteps = recordedSteps.map(step => ({
-        type: step.type,
-        selector: step.selector,
-        value: step.value,
-        text: step.text,
-        timestamp: step.timestamp
-      }));
+      const simplifiedSteps = recordedSteps.map(step => {
+        const copy = { ...step };
+        delete copy.screenshotBase64;
+        if (copy.element) {
+          copy.element = {
+            ...copy.element,
+            text: String(copy.element.text || '').slice(0, 80),
+            className: String(copy.element.className || '').slice(0, 200)
+          };
+        }
+        if (copy.visualDescription) {
+          copy.visualDescription = String(copy.visualDescription).slice(0, 200);
+        }
+        return copy;
+      });
       await chrome.storage.local.set({ [STORAGE_KEY]: simplifiedSteps });
       console.log('✅ 已保存简化版步骤数据');
     } catch (fallbackError) {
@@ -956,15 +1081,8 @@ async function restoreRecordingState() {
       await new Promise(resolve => setTimeout(resolve, 200));
       
       // 重新添加事件监听器
-      document.removeEventListener('click', recordClick, true);
-      document.removeEventListener('input', recordInput, true);
-      document.removeEventListener('change', recordChange, true);
-      document.removeEventListener('submit', recordSubmit, true);
-      
-      document.addEventListener('click', recordClick, true);
-      document.addEventListener('input', recordInput, true);
-      document.addEventListener('change', recordChange, true);
-      document.addEventListener('submit', recordSubmit, true);
+      unbindRecordingListeners();
+      bindRecordingListeners();
       
       isRecording = true;
       console.log('✅ 录制状态已自动恢复，事件监听器已重新添加');
@@ -1056,7 +1174,15 @@ const checkUrlChange = () => {
   const currentUrl = window.location.href;
   if (currentUrl !== lastUrl) {
     console.log('🔄 检测到页面URL变化:', lastUrl, '->', currentUrl);
+    const previousUrl = lastUrl;
     lastUrl = currentUrl;
+
+    if (isRecording) {
+      emitRecordedStep(buildRecordedStep('navigate', null, {
+        url: currentUrl,
+        fromUrl: previousUrl
+      }));
+    }
     
     // URL变化时保存步骤和状态
     if (recordedSteps.length > 0 || isRecording) {
@@ -1070,15 +1196,8 @@ const checkUrlChange = () => {
       setTimeout(() => {
         if (isRecording) {
           // 重新添加事件监听器（移除旧的，添加新的）
-          document.removeEventListener('click', recordClick, true);
-          document.removeEventListener('input', recordInput, true);
-          document.removeEventListener('change', recordChange, true);
-          document.removeEventListener('submit', recordSubmit, true);
-          
-          document.addEventListener('click', recordClick, true);
-          document.addEventListener('input', recordInput, true);
-          document.addEventListener('change', recordChange, true);
-          document.addEventListener('submit', recordSubmit, true);
+          unbindRecordingListeners();
+          bindRecordingListeners();
           
           console.log('✅ URL变化后事件监听器已重新绑定');
         }
@@ -1127,9 +1246,28 @@ window.addEventListener('pagehide', (event) => {
   }
 });
 
+function bindRecordingListeners() {
+  document.addEventListener('click', recordClick, true);
+  document.addEventListener('input', recordInput, true);
+  document.addEventListener('change', recordChange, true);
+  document.addEventListener('submit', recordSubmit, true);
+  document.addEventListener('scroll', recordScroll, true);
+  document.addEventListener('keydown', recordKeydown, true);
+}
+
+function unbindRecordingListeners() {
+  document.removeEventListener('click', recordClick, true);
+  document.removeEventListener('input', recordInput, true);
+  document.removeEventListener('change', recordChange, true);
+  document.removeEventListener('submit', recordSubmit, true);
+  document.removeEventListener('scroll', recordScroll, true);
+  document.removeEventListener('keydown', recordKeydown, true);
+}
+
 // 录制功能：开始录制
-function startRecording() {
+function startRecording(caseId = null) {
   try {
+    _recordingCaseId = caseId || _recordingCaseId;
     console.log('🎬 开始录制用户操作');
     console.log('📊 当前录制状态:', isRecording);
     console.log('📊 当前录制步骤数:', recordedSteps.length);
@@ -1174,20 +1312,14 @@ function startRecording() {
     
     // 先移除可能已存在的事件监听器（避免重复添加）
     console.log('🧹 清理可能存在的旧事件监听器...');
-    document.removeEventListener('click', recordClick, true);
-    document.removeEventListener('input', recordInput, true);
-    document.removeEventListener('change', recordChange, true);
-    document.removeEventListener('submit', recordSubmit, true);
+    unbindRecordingListeners();
     
     // 追加录制模式：不清空已存在的步骤
     console.log('🧩 采用追加录制模式，保留已有步骤:', recordedSteps.length);
     
     // 添加事件监听器
     console.log('📝 添加事件监听器...');
-    document.addEventListener('click', recordClick, true);
-    document.addEventListener('input', recordInput, true);
-    document.addEventListener('change', recordChange, true);
-    document.addEventListener('submit', recordSubmit, true);
+    bindRecordingListeners();
     
     isRecording = true;
     console.log('✅ 事件监听器已添加，录制状态:', isRecording);
@@ -1216,10 +1348,7 @@ function stopRecording() {
   isRecording = false;
   
   // 移除事件监听器
-  document.removeEventListener('click', recordClick, true);
-  document.removeEventListener('input', recordInput, true);
-  document.removeEventListener('change', recordChange, true);
-  document.removeEventListener('submit', recordSubmit, true);
+  unbindRecordingListeners();
   
   // 清除所有高亮样式
   if (typeof clearAllHighlights === 'function') {
@@ -1250,10 +1379,7 @@ function clearRecording() {
   _inputPendingSteps.clear();
   
   // 移除事件监听器
-  document.removeEventListener('click', recordClick, true);
-  document.removeEventListener('input', recordInput, true);
-  document.removeEventListener('change', recordChange, true);
-  document.removeEventListener('submit', recordSubmit, true);
+  unbindRecordingListeners();
   
   // 清除所有高亮样式
   if (typeof clearAllHighlights === 'function') {
@@ -1280,84 +1406,59 @@ function clearRecording() {
 // 录制点击事件
 function recordClick(event) {
   try {
-    console.log('🖱️ 点击事件触发，录制状态:', isRecording);
-    
-    if (!isRecording) {
-      console.log('❌ 录制未激活，忽略点击事件');
-      return;
-    }
-    
-    console.log('🖱️ 检测到点击事件，开始录制');
-    const target = event.target;
-    console.log('🎯 点击目标:', target);
-    console.log('🏷️ 标签名:', target.tagName);
-    console.log('📝 文本内容:', target.innerText || target.textContent);
-    
-    const selector = generateSelector(target);
-    // 针对开关/复选框：直接记录为 toggle，避免后续多条重复
-    if ((target.type === 'checkbox') || target.getAttribute('role') === 'switch' || target.hasAttribute('aria-checked')) {
-      const targetState = target.type === 'checkbox' ? !!target.checked : (String(target.getAttribute('aria-checked')) !== 'false');
-      const step = {
-        type: 'toggle',
+    if (!isRecording) return;
+
+    const rawTarget = event.target;
+    if (!(rawTarget instanceof Element)) return;
+
+    // label / span 等包装元素点击时，映射到真正的 checkbox
+    const checkboxTarget = resolveCheckboxTarget(rawTarget);
+    const toggleTarget = checkboxTarget || (
+      rawTarget.getAttribute('role') === 'switch' || rawTarget.hasAttribute('aria-checked')
+        ? rawTarget
+        : null
+    );
+
+    if (toggleTarget) {
+      const selector = generateSelector(toggleTarget);
+      const targetState = toggleTarget.type === 'checkbox'
+        ? !!toggleTarget.checked
+        : String(toggleTarget.getAttribute('aria-checked')) !== 'false';
+      const step = buildRecordedStep('toggle', toggleTarget, {
         selector,
         targetState,
-        timestamp: Date.now(),
-        tagName: target.tagName
-      };
-      // 防抖/去重：短时间对同一元素的重复记录丢弃
+        text: getDirectText(toggleTarget) || toggleTarget.innerText?.trim() || ''
+      });
+
       if (step.timestamp - _lastRecord.time < 250 && _lastRecord.selector === selector && _lastRecord.type === step.type) {
         return;
       }
       _lastRecord = { time: step.timestamp, selector, type: step.type };
-      _suppressMap.set(selector, step.timestamp + 350); // 抑制后续 input/change
-      recordedSteps.push(step);
+      _suppressMap.set(selector, step.timestamp + 350);
+      emitRecordedStep(step);
       console.log('录制开关/复选框切换:', step);
-      
-      // 推送到侧边栏
-      try { chrome.runtime.sendMessage({ action: 'stepRecorded', step }); } catch (_) {}
-      
-      // 保存完整的步骤数组
-      saveRecordedSteps();
-      
-      if (typeof highlight === 'function') highlight(target);
+      enhanceStepWithAi(step, _recordingCaseId);
+      if (typeof highlight === 'function') highlight(toggleTarget);
       return;
     }
-    
-    const directText = getDirectText(target) || target.innerText?.trim() || '';
-    const step = {
-      type: 'click',
+
+    // 点击可能落在按钮内部的 span/svg 上，向上归一到可交互祖先
+    const target = resolveActionableTarget(rawTarget);
+    const selector = generateSelector(target);
+    const step = buildRecordedStep('click', target, {
       selector,
-      selectorFallbacks: generateSelectorFallbacks(target),
-      text: directText,
-      timestamp: Date.now(),
-      tagName: target.tagName,
-      className: target.className,
-      id: target.id
-    };
+      text: getDirectText(target) || target.innerText?.trim() || ''
+    });
+
     if (step.timestamp - _lastRecord.time < 250 && _lastRecord.selector === selector && _lastRecord.type === step.type) {
       return;
     }
     _lastRecord = { time: step.timestamp, selector, type: step.type };
-    
-    recordedSteps.push(step);
+
+    emitRecordedStep(step);
     console.log('✅ 录制点击成功:', step);
-    console.log('📊 当前录制步骤数:', recordedSteps.length);
-
-    // AI 增强：截图 + Vision Agent 描述
-    enhanceStepWithAi(step);
-
-    // 推送到侧边栏，实时更新步骤列表
-    try { chrome.runtime.sendMessage({ action: 'stepRecorded', step }); } catch (_) {}
-
-    // 保存完整的步骤数组（避免重复追加）
-    saveRecordedSteps();
-
-    // 高亮显示被点击的元素
-    if (typeof highlight === 'function') {
-      highlight(target);
-    } else {
-      console.warn('⚠️ highlight 函数不存在');
-    }
+    enhanceStepWithAi(step, _recordingCaseId);
+    if (typeof highlight === 'function') highlight(target);
   } catch (error) {
     console.error('❌ 录制点击事件失败:', error);
   }
@@ -1451,8 +1552,13 @@ function toggleCheckbox(selector, targetState) {
 // 录制输入事件（使用防抖，合并连续输入为一条）
 function recordInput(event) {
   if (!isRecording) return;
-  
-  const target = event.target;
+
+  const rawTarget = event.target;
+  if (!(rawTarget instanceof Element)) return;
+  const target = resolveActionableTarget(rawTarget);
+  // select / checkbox / radio 由 setOptions / toggle 负责，避免 input + change 双写。
+  if (target.tagName === 'SELECT') return;
+  if (target.type === 'checkbox' || target.type === 'radio') return;
   const selector = generateSelector(target);
   const now = Date.now();
   
@@ -1474,24 +1580,24 @@ function recordInput(event) {
   if (stepIndex !== undefined && stepIndex >= 0 && stepIndex < recordedSteps.length) {
     // 更新已存在的输入步骤
     step = recordedSteps[stepIndex];
-    step.value = target.value; // 更新为最新值
+    step.value = 'value' in target ? target.value : (target.innerText || ''); // 更新为最新值
     step.timestamp = now; // 更新时间戳
+    if (!Array.isArray(step.selectorFallbacks) || step.selectorFallbacks.length === 0) {
+      step.selectorFallbacks = generateSelectorFallbacks(target);
+    }
+    if (!step.element) step.element = getElementSnapshot(target);
     console.log('📝 更新输入步骤:', stepIndex, step);
   } else {
     // 创建新的输入步骤
-    step = {
-      type: 'input',
-      selector: selector,
-      selectorFallbacks: generateSelectorFallbacks(target),
-      value: target.value,
-      timestamp: now,
-      tagName: target.tagName,
-      inputType: target.type
-    };
+    step = buildRecordedStep('input', target, {
+      selector,
+      value: 'value' in target ? target.value : (target.innerText || ''),
+      inputType: target.type || ''
+    });
     
     // 添加到步骤列表
     stepIndex = recordedSteps.length;
-    recordedSteps.push(step);
+    emitRecordedStep(step);
     _inputPendingSteps.set(selector, stepIndex);
     console.log('📝 创建新输入步骤:', stepIndex, step);
   }
@@ -1501,7 +1607,8 @@ function recordInput(event) {
     // 保存最终值
     if (stepIndex !== undefined && stepIndex >= 0 && stepIndex < recordedSteps.length) {
       const finalStep = recordedSteps[stepIndex];
-      finalStep.value = target.value; // 确保是最新值
+      finalStep.value = 'value' in target ? target.value : (target.innerText || ''); // 确保是最新值
+      finalStep.timestamp = Date.now();
       console.log('💾 输入完成，保存最终值:', finalStep);
       
       // 推送到侧边栏
@@ -1509,6 +1616,7 @@ function recordInput(event) {
       
       // 保存完整的步骤数组
       saveRecordedSteps();
+      enhanceStepWithAi(finalStep, _recordingCaseId);
       
       // 清理
       _inputDebounceTimers.delete(selector);
@@ -1527,7 +1635,8 @@ function recordInput(event) {
     
     if (stepIndex !== undefined && stepIndex >= 0 && stepIndex < recordedSteps.length) {
       const finalStep = recordedSteps[stepIndex];
-      finalStep.value = target.value; // 确保是最新值
+      finalStep.value = 'value' in target ? target.value : (target.innerText || ''); // 确保是最新值
+      finalStep.timestamp = Date.now();
       console.log('💾 输入框失去焦点，立即保存:', finalStep);
       
       // 推送到侧边栏
@@ -1535,6 +1644,7 @@ function recordInput(event) {
       
       // 保存完整的步骤数组
       saveRecordedSteps();
+      enhanceStepWithAi(finalStep, _recordingCaseId);
       
       // 清理
       _inputPendingSteps.delete(selector);
@@ -1552,30 +1662,39 @@ function recordInput(event) {
 // 录制表单提交事件
 function recordSubmit(event) {
   if (!isRecording) return;
-  
-  const target = event.target;
-  const step = {
-    type: 'submit',
-    selector: generateSelector(target),
-    timestamp: Date.now(),
-    tagName: target.tagName
-  };
-  
-  recordedSteps.push(step);
+
+  const rawTarget = event.target;
+  if (!(rawTarget instanceof Element)) return;
+  const target = resolveActionableTarget(rawTarget);
+  const selector = generateSelector(target);
+
+  // 点击提交按钮会同时产生 click 和 submit；回放 click 已经能提交，
+  // 再执行 submit 会重复提交。仅在最近一次操作就是提交控件点击时省略。
+  const previous = recordedSteps[recordedSteps.length - 1];
+  const previousAt = previous
+    ? (typeof previous.timestamp === 'number' ? previous.timestamp : Date.parse(previous.timestamp) || 0)
+    : 0;
+  const previousInputType = String(previous?.element?.inputType || '').toLowerCase();
+  if (previous?.type === 'click'
+      && ['submit', 'image'].includes(previousInputType)
+      && Date.now() - previousAt < 2000) {
+    return;
+  }
+
+  const step = buildRecordedStep('submit', target, { selector });
+
+  emitRecordedStep(step);
   console.log('录制提交:', step);
-  
-  // 推送到侧边栏
-  try { chrome.runtime.sendMessage({ action: 'stepRecorded', step }); } catch (_) {}
-  
-  // 保存完整的步骤数组
-  saveRecordedSteps();
+  enhanceStepWithAi(step, _recordingCaseId);
 }
 
 // 录制选择变化事件
 function recordChange(event) {
   if (!isRecording) return;
-  
-  const target = event.target;
+
+  const rawTarget = event.target;
+  if (!(rawTarget instanceof Element)) return;
+  const target = resolveActionableTarget(rawTarget);
   const selector = generateSelector(target);
   let step;
   const now = Date.now();
@@ -1585,35 +1704,78 @@ function recordChange(event) {
   }
   if (target.tagName === 'SELECT' && target.multiple) {
     const values = Array.from(target.selectedOptions || []).map(o => o.value);
-    step = {
-      type: 'setOptions',
-      selector,
-      values,
-      timestamp: Date.now(),
-      tagName: target.tagName
-    };
+    step = buildRecordedStep('setOptions', target, { selector, values });
   } else {
-    step = {
-      type: 'change',
-      selector,
-      value: target.value,
-      timestamp: Date.now(),
-      tagName: target.tagName
-    };
+    // 文本输入已经由 input 事件记录，change 只负责 select 等非文本控件。
+    const isTextLike = target.tagName === 'TEXTAREA'
+      || target.isContentEditable
+      || (target.tagName === 'INPUT' && !['checkbox', 'radio', 'file', 'submit', 'button', 'reset'].includes(target.type));
+    if (isTextLike) return;
+    step = buildRecordedStep('change', target, { selector, value: target.value });
   }
   if (step.timestamp - _lastRecord.time < 250 && _lastRecord.selector === selector && _lastRecord.type === step.type) {
     return;
   }
   _lastRecord = { time: step.timestamp, selector, type: step.type };
   
-  recordedSteps.push(step);
+  emitRecordedStep(step);
   console.log('录制变化:', step);
-  
-  // 推送到侧边栏
-  try { chrome.runtime.sendMessage({ action: 'stepRecorded', step }); } catch (_) {}
-  
-  // 保存完整的步骤数组
-  saveRecordedSteps();
+  enhanceStepWithAi(step, _recordingCaseId);
+}
+
+// 录制滚动事件：合并滚动过程中的连续事件，只保存最终位置
+function recordScroll(event) {
+  if (!isRecording) return;
+
+  const rawTarget = event.target;
+  const isWindowScroll = rawTarget === document || rawTarget === document.documentElement || rawTarget === document.body;
+  const container = isWindowScroll ? null : (rawTarget instanceof Element ? rawTarget : null);
+  const selector = container ? generateSelector(container) : '';
+  const key = selector || '__window__';
+  const top = container ? container.scrollTop : window.scrollY;
+  const left = container ? container.scrollLeft : window.scrollX;
+  const previous = _lastScrollPositions.get(key);
+
+  if (previous && Math.abs(previous.top - top) < 8 && Math.abs(previous.left - left) < 8) {
+    return;
+  }
+  _lastScrollPositions.set(key, { top, left });
+
+  clearTimeout(_scrollDebounceTimers.get(key));
+  _scrollDebounceTimers.set(key, setTimeout(() => {
+    const step = buildRecordedStep('scroll', container, {
+      selector,
+      scrollTop: Math.round(top),
+      scrollLeft: Math.round(left)
+    });
+    emitRecordedStep(step);
+    enhanceStepWithAi(step, _recordingCaseId);
+  }, 300));
+}
+
+// 录制非文本按键（避免把逐字符输入拆成大量步骤）
+function recordKeydown(event) {
+  if (!isRecording) return;
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+
+  const specialKeys = new Set([
+    'Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+    'PageUp', 'PageDown', 'Home', 'End'
+  ]);
+  const hasModifier = event.ctrlKey || event.metaKey || event.altKey;
+  if (!specialKeys.has(event.key) && !hasModifier) return;
+  if (['Control', 'Meta', 'Alt', 'Shift'].includes(event.key)) return;
+
+  const actionable = resolveActionableTarget(target);
+  const step = buildRecordedStep('press', actionable, {
+    key: event.key,
+    ctrlKey: !!event.ctrlKey,
+    metaKey: !!event.metaKey,
+    altKey: !!event.altKey,
+    shiftKey: !!event.shiftKey
+  });
+  emitRecordedStep(step);
 }
 
 // ===================== 选择器生成工具 =====================
@@ -1894,13 +2056,18 @@ const stepExecutors = {
   },
   async submit(step) {
     const selector = String(step.selector || 'form');
-    const el = document.querySelector(selector);
+    const el = findElementWithFallbacks(selector, step.selectorFallbacks)
+      || document.querySelector(selector);
     if (!el) return { ok: false, message: '未找到可提交元素' };
     const form = el.tagName === 'FORM' ? el : (el.form || el.closest('form'));
     if (!form) return { ok: false, message: '未找到表单' };
-    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    if (typeof form.submit === 'function') {
-      try { form.submit(); } catch(_) {}
+    if (typeof form.requestSubmit === 'function') {
+      form.requestSubmit();
+    } else {
+      const submitted = form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      if (submitted && typeof form.submit === 'function') {
+        try { form.submit(); } catch(_) {}
+      }
     }
     // 提交后等待更长时间，给页面跳转时间
     await sleep(500);
@@ -1908,7 +2075,7 @@ const stepExecutors = {
   },
   async change(step) {
     const selector = String(step.selector || '');
-    const el = selector ? document.querySelector(selector) : null;
+    const el = selector ? findElementWithFallbacks(selector, step.selectorFallbacks) : null;
     if (!el) return { ok: false, message: '未找到元素' };
     if (el.tagName === 'SELECT' && el.multiple && Array.isArray(step.values)) {
       Array.from(el.options).forEach(opt => { opt.selected = step.values.includes(opt.value); });
@@ -1924,9 +2091,30 @@ const stepExecutors = {
     el.dispatchEvent(new Event('change', { bubbles: true }));
     return { ok: true };
   },
+  async setOptions(step) {
+    const selector = String(step.selector || '');
+    const el = selector ? findElementWithFallbacks(selector, step.selectorFallbacks) : null;
+    if (!el) return { ok: false, message: '未找到下拉框' };
+
+    const values = Array.isArray(step.values)
+      ? step.values.map(String)
+      : (step.value != null ? [String(step.value)] : []);
+    if (el.tagName !== 'SELECT') {
+      return { ok: false, message: 'setOptions 仅支持 select 元素' };
+    }
+
+    if (el.multiple) {
+      Array.from(el.options).forEach(opt => { opt.selected = values.includes(opt.value); });
+    } else if (values.length > 0) {
+      el.value = values[0];
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true };
+  },
   async toggle(step) {
     const selector = String(step.selector || '');
-    const el = selector ? document.querySelector(selector) : null;
+    const el = selector ? findElementWithFallbacks(selector, step.selectorFallbacks) : null;
     if (!el) return { ok: false, message: '未找到元素' };
     if (el.type === 'checkbox') {
       el.checked = !!step.targetState;
@@ -1942,18 +2130,82 @@ const stepExecutors = {
     }
     // fallback：尝试点击
     const maxWait = Number(step.maxWait || 5000);
-    const r = await clickBySelector(selector, maxWait);
+    const r = await clickBySelector(selector, step.selectorFallbacks, maxWait);
     return normalizeResult(r);
   },
   async scroll(step) {
     const selector = String(step.selector || '');
     if (selector) {
-      const el = document.querySelector(selector);
-      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const el = findElementWithFallbacks(selector, step.selectorFallbacks);
+      if (!el) return { ok: false, message: '未找到滚动目标' };
+      if (step.scrollTop != null || step.scrollLeft != null) {
+        el.scrollTo({
+          top: Number(step.scrollTop || 0),
+          left: Number(step.scrollLeft || 0),
+          behavior: 'smooth'
+        });
+      } else {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
     } else {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      window.scrollTo({
+        top: Number(step.scrollTop != null ? step.scrollTop : 0),
+        left: Number(step.scrollLeft != null ? step.scrollLeft : 0),
+        behavior: 'smooth'
+      });
     }
     return { ok: true };
+  },
+  async press(step) {
+    const selector = String(step.selector || '');
+    const el = selector ? findElementWithFallbacks(selector, step.selectorFallbacks) : document.activeElement;
+    if (!el) return { ok: false, message: '未找到按键目标' };
+    if (typeof el.focus === 'function') el.focus();
+
+    const init = {
+      key: String(step.key || 'Enter'),
+      code: String(step.code || step.key || 'Enter'),
+      bubbles: true,
+      cancelable: true,
+      ctrlKey: !!step.ctrlKey,
+      metaKey: !!step.metaKey,
+      altKey: !!step.altKey,
+      shiftKey: !!step.shiftKey
+    };
+    el.dispatchEvent(new KeyboardEvent('keydown', init));
+    el.dispatchEvent(new KeyboardEvent('keyup', init));
+    return { ok: true };
+  },
+  async navigate(step) {
+    const url = String(step.url || step.value || '');
+    if (!url) return { ok: false, message: '缺少跳转地址' };
+    if (window.location.href === url) return { ok: true };
+    window.location.assign(url);
+    await sleep(300);
+    return { ok: true };
+  },
+  async assert(step) {
+    const assertion = step.assertion && typeof step.assertion === 'object' ? step.assertion : {};
+    const kind = assertion.kind || step.assertKind || (step.selector ? 'visible' : 'text');
+    const expected = assertion.expected != null ? assertion.expected : (step.expected != null ? step.expected : step.value);
+
+    if (kind === 'url') {
+      const ok = window.location.href.includes(String(expected || ''));
+      return { ok, message: ok ? 'URL 断言通过' : `URL 不包含: ${expected}` };
+    }
+
+    const selector = String(assertion.selector || step.selector || '');
+    if (!selector) return { ok: false, message: '断言缺少选择器' };
+    const el = findElementWithFallbacks(selector, step.selectorFallbacks);
+    if (kind === 'visible' || kind === 'exists') {
+      const ok = kind === 'exists' ? !!el : !!(el && isVisible(el));
+      return { ok, message: ok ? '元素断言通过' : `元素不存在或不可见: ${selector}` };
+    }
+    if (!el) return { ok: false, message: `未找到断言元素: ${selector}` };
+
+    const actual = String(el.innerText != null ? el.innerText : el.textContent || '').trim();
+    const ok = actual.includes(String(expected == null ? '' : expected));
+    return { ok, message: ok ? '文本断言通过' : `期望包含 "${expected}"，实际为 "${actual}"` };
   }
 };
 
@@ -2077,7 +2329,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // 录制功能消息处理
     if (type === "startRecording") {
       console.log('🎬 Content script 收到开始录制消息');
-      const result = startRecording();
+      const result = startRecording(msg.caseId || null);
       console.log('🎬 录制启动结果:', result);
       sendResponse(result);
       return true;

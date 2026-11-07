@@ -9,15 +9,15 @@
 - 启动Flask服务端
 - 自动激活虚拟环境
 - 日志输出到 `logs/app.log`
-- 错误日志输出到 `logs/error.log`
-- 同时显示在控制台
+- 将 PID 写入 `.run/server.pid`
+- 通过 `PORT` 环境变量覆盖默认端口 5001
 
 ### 2. 停止服务端
 ```bash
 ./stop.sh
 ```
-- 停止所有Flask服务端进程
-- 释放端口5000
+- 按 `.run/server.pid` 停止对应进程
+- 释放端口 5001（或 `PORT` 指定端口）
 
 ### 3. 重启服务端
 ```bash
@@ -36,7 +36,6 @@
 ## 日志文件
 
 - **应用日志**: `logs/app.log` - 包含所有请求和操作日志
-- **错误日志**: `logs/error.log` - 包含错误信息
 - **日志轮转**: 每个日志文件最大10KB，保留10个备份文件
 
 ## 实时查看日志
@@ -45,28 +44,25 @@
 # 实时查看应用日志
 tail -f logs/app.log
 
-# 实时查看错误日志
-tail -f logs/error.log
-
 # 查看所有日志
 tail -f logs/*.log
 ```
 
 ## 服务地址
 
-- **健康检查**: http://localhost:5000/api/health
-- **用例列表**: http://localhost:5000/api/cases
-- **创建用例**: POST http://localhost:5000/api/cases
+- **健康检查**: http://localhost:5001/api/health
+- **用例列表**: http://localhost:5001/api/cases
+- **创建用例**: POST http://localhost:5001/api/cases
 
 ## 故障排除
 
 ### 端口被占用
 ```bash
 # 查看端口占用
-lsof -i :5000
+lsof -i :5001
 
 # 强制停止占用进程
-sudo lsof -ti:5000 | xargs kill -9
+sudo lsof -ti:5001 | xargs kill -9
 ```
 
 ### 虚拟环境问题

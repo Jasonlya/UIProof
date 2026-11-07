@@ -1,7 +1,10 @@
 import sys
 import os
-# 确保 server/ 目录在 Python path 中
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 同时保留 server/ 与项目根目录，兼容 `python app.py` 和 `python -m server.app`
+SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SERVER_DIR)
+sys.path.insert(0, SERVER_DIR)
+sys.path.insert(0, PROJECT_ROOT)
 
 from flask import Flask
 from flask_cors import CORS
@@ -14,6 +17,8 @@ from routes import register_routes
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
+    app.config['SERVER_PORT'] = int(os.environ.get('PORT', '5001'))
+    app.config['DEBUG'] = os.environ.get('FLASK_DEBUG') == '1'
 
     db.init_app(app)
     CORS(app)
@@ -31,10 +36,14 @@ def create_app():
 
 def configure_logging(app):
     if not app.debug:
-        if not os.path.exists('logs'):
-            os.mkdir('logs')
+        log_dir = os.path.join(app.root_path, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
 
-        file_handler = RotatingFileHandler('logs/app.log', maxBytes=10240, backupCount=10)
+        file_handler = RotatingFileHandler(
+            os.path.join(log_dir, 'app.log'),
+            maxBytes=10240,
+            backupCount=10,
+        )
         file_handler.setFormatter(logging.Formatter(
             '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
         ))
@@ -49,4 +58,8 @@ app = create_app()
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    app.run(
+        debug=app.config['DEBUG'],
+        host='0.0.0.0',
+        port=app.config['SERVER_PORT'],
+    )

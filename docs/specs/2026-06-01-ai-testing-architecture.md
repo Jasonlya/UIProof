@@ -1,5 +1,7 @@
 # UIProof AI 自动化测试能力设计
 
+> **历史设计说明（2026-11-07）**：本文记录服务端 Playwright + LangGraph 执行器的早期设计，部分 API 与数据字段已被新的 Run 生命周期取代。当前架构以扩展可见执行为默认执行面，Run API 见 `docs/api/runs.md`，最新清理设计见 `docs/superpowers/specs/2026-11-07-uiproof-architecture-cleanup-design.md`。
+
 ## 概述
 
 UIProof 以 Chrome 侧边栏为统一入口，将用例管理、浏览器操作录制、AI 执行、视觉定位、AI 断言和性能分析整合为一套端到端 UI 自动化测试平台。后端通过 LangGraph 编排执行流水线，由 Playwright 驱动真实浏览器，并使用多模态模型提升元素定位、失败自愈和结果校验能力。

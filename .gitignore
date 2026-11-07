@@ -39,6 +39,7 @@ server/instance/*.sqlite3-*
 # 日志
 *.log
 server/logs/
+server/.run/
 
 # 前端/JS 常见产物
 node_modules/

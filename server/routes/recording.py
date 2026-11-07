@@ -1,18 +1,25 @@
 # server/routes/recording.py
 """录制增强路由 — 截图上传、AI 描述、步骤优化"""
+from __future__ import annotations
+
 from flask import Blueprint, request, jsonify
 from models.models import db, TestCase, StepSnapshot
 import asyncio
 import base64
 import json
 import logging
+import re
 import uuid
 import os
 from pathlib import Path
 
+from services.step_schema import StepValidationError, normalize_steps
+
 logger = logging.getLogger(__name__)
 
 bp = Blueprint('recording', __name__, url_prefix='/api/recording')
+
+MAX_SCREENSHOT_BASE64 = 12 * 1024 * 1024
 
 
 @bp.route('/screenshot', methods=['POST'])
@@ -26,12 +33,21 @@ def upload_screenshot():
 
     if not image_data:
         return jsonify({"error": "缺少图片数据"}), 400
+    if not isinstance(image_data, str):
+        return jsonify({"error": "图片数据必须是 base64 字符串"}), 400
+    if len(image_data) > MAX_SCREENSHOT_BASE64:
+        return jsonify({"error": "图片数据过大"}), 413
 
     # 保存截图文件
-    screenshots_dir = Path("screenshots") / "recording" / (case_id or "temp")
+    safe_case_id = re.sub(r'[^A-Za-z0-9_-]', '_', str(case_id or 'temp'))[:64] or 'temp'
+    screenshots_dir = Path("screenshots") / "recording" / safe_case_id
     screenshots_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = f"step_{step_index}_{uuid.uuid4().hex[:8]}.png"
+    try:
+        safe_step_index = int(step_index)
+    except (TypeError, ValueError):
+        safe_step_index = 0
+    filename = f"step_{safe_step_index}_{uuid.uuid4().hex[:8]}.png"
     filepath = screenshots_dir / filename
 
     try:
@@ -43,7 +59,7 @@ def upload_screenshot():
     # 创建数据库记录
     snapshot = StepSnapshot(
         case_id=case_id,
-        step_index=step_index,
+        step_index=safe_step_index,
         phase=phase,
         screenshot_path=str(filepath),
     )
@@ -53,7 +69,7 @@ def upload_screenshot():
     return jsonify({
         "snapshot_id": snapshot.snapshot_id,
         "screenshot_path": str(filepath),
-        "step_index": step_index,
+        "step_index": safe_step_index,
     })
 
 
@@ -173,8 +189,13 @@ def save_recorded_case():
     data = request.get_json() or {}
     name = data.get("name", "未命名用例")
     description = data.get("description", "")
-    steps = data.get("steps", [])
-    setup_steps = data.get("setup_steps", [])
+    try:
+        steps = normalize_steps(data.get("steps", []))
+        setup_steps = normalize_steps(data.get("setup_steps", []))
+    except StepValidationError as exc:
+        logger.warning(f"录制用例步骤校验失败: {exc}")
+        return jsonify({"error": str(exc)}), 400
+
     folder_id = data.get("folder_id")
     expected = data.get("expected", "")
 

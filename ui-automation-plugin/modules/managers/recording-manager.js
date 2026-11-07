@@ -694,7 +694,8 @@ class RecordingManager {
         await this.sendMessageWithTimeout(tabId, { type: 'clearRecording' }, 3000);
       }
       // 再发送开始录制消息
-      const response = await this.sendMessageWithTimeout(tabId, { type: 'startRecording' }, 3000);
+      const caseId = this.caseManager?.currentEditingCase?.case_id || null;
+      const response = await this.sendMessageWithTimeout(tabId, { type: 'startRecording', caseId }, 3000);
       console.log('startRecording response:', response);
       
       if (response && response.ok) {
@@ -1058,6 +1059,12 @@ class RecordingManager {
             <option value="input" ${step.type === 'input' ? 'selected' : ''}>输入</option>
             <option value="wait" ${step.type === 'wait' ? 'selected' : ''}>等待</option>
             <option value="scroll" ${step.type === 'scroll' ? 'selected' : ''}>滚动</option>
+            <option value="change" ${step.type === 'change' ? 'selected' : ''}>改变</option>
+            <option value="submit" ${step.type === 'submit' ? 'selected' : ''}>提交</option>
+            <option value="toggle" ${step.type === 'toggle' ? 'selected' : ''}>切换</option>
+            <option value="setOptions" ${step.type === 'setOptions' ? 'selected' : ''}>多选</option>
+            <option value="press" ${step.type === 'press' ? 'selected' : ''}>按键</option>
+            <option value="assert" ${step.type === 'assert' ? 'selected' : ''}>断言</option>
           </select>
         </div>
         <div class="form-group">
@@ -1066,7 +1073,7 @@ class RecordingManager {
         </div>
         <div class="form-group">
           <label>值:</label>
-          <input type="text" id="editStepValue" value="${step.value || ''}" placeholder="输入值或等待时间">
+          <input type="text" id="editStepValue" value="${step.value || (Array.isArray(step.values) ? step.values.join(',') : '') || (step.assertion && step.assertion.expected) || ''}" placeholder="输入值、等待时间、按键或断言文本">
         </div>
         <div class="form-group">
           <label>描述:</label>
@@ -1088,19 +1095,35 @@ class RecordingManager {
       const value = document.getElementById('editStepValue').value.trim();
       const description = document.getElementById('editStepDescription').value.trim();
       
-      if (!selector && type !== 'wait') {
+      if (!selector && !['wait', 'assert'].includes(type)) {
         this.setStatus('请输入选择器', false);
         return;
       }
       
       // 更新步骤
-      this.recordedSteps[stepIndex] = {
+      const nextStep = {
         ...step,
+        schemaVersion: step.schemaVersion || 2,
+        clientStepId: step.clientStepId || `manual_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        selectorFallbacks: Array.isArray(step.selectorFallbacks) ? step.selectorFallbacks : [],
         type,
         selector,
         value,
         description: description || this.generateStepDescription(type, selector, value)
       };
+      if (type === 'setOptions') {
+        nextStep.values = value.split(',').map(item => item.trim()).filter(Boolean);
+      }
+      if (type === 'toggle') {
+        nextStep.targetState = ['true', '1', 'checked', 'on'].includes(value.toLowerCase());
+      }
+      if (type === 'assert') {
+        nextStep.assertion = { kind: selector ? 'text' : 'url', expected: value };
+      }
+      if (type === 'press') {
+        nextStep.key = value || 'Enter';
+      }
+      this.recordedSteps[stepIndex] = nextStep;
       
       // 更新UI
       this.updateStepsList();
@@ -1294,6 +1317,10 @@ class RecordingManager {
             <option value="scroll">滚动</option>
             <option value="change">改变</option>
             <option value="submit">提交</option>
+            <option value="toggle">切换</option>
+            <option value="setOptions">多选</option>
+            <option value="press">按键</option>
+            <option value="assert">断言</option>
           </select>
         </div>
         <div class="form-group">
@@ -1325,7 +1352,28 @@ class RecordingManager {
       const value = modal.querySelector('#newStepValue').value.trim();
       const description = modal.querySelector('#newStepDescription').value.trim();
 
-      const step = { type, selector, value, description: description || this.generateStepDescription(type, selector, value) };
+      const step = {
+        schemaVersion: 2,
+        clientStepId: `manual_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        type,
+        selector,
+        value,
+        selectorFallbacks: [],
+        timestamp: new Date().toISOString(),
+        description: description || this.generateStepDescription(type, selector, value)
+      };
+      if (type === 'setOptions') {
+        step.values = value.split(',').map(item => item.trim()).filter(Boolean);
+      }
+      if (type === 'toggle') {
+        step.targetState = ['true', '1', 'checked', 'on'].includes(value.toLowerCase());
+      }
+      if (type === 'assert') {
+        step.assertion = { kind: selector ? 'text' : 'url', expected: value };
+      }
+      if (type === 'press') {
+        step.key = value || 'Enter';
+      }
 
       // 插入位置：选中则插到最后一个选中的后面；否则追加到末尾
       let insertIndex = this.recordedSteps.length;
@@ -1362,6 +1410,18 @@ class RecordingManager {
         return `等待 ${value} 毫秒`;
       case 'scroll':
         return `滚动到 ${selector}`;
+      case 'change':
+        return `改变 ${selector} 的值为 "${value}"`;
+      case 'submit':
+        return `提交 ${selector}`;
+      case 'toggle':
+        return `切换 ${selector}`;
+      case 'setOptions':
+        return `选择 ${selector} 的选项: ${value}`;
+      case 'press':
+        return `在 ${selector || '当前元素'} 按下 ${value || 'Enter'}`;
+      case 'assert':
+        return `断言 ${selector || '当前页面'}: ${value}`;
       default:
         return `${type} 操作`;
     }
@@ -1379,7 +1439,10 @@ class RecordingManager {
       'wait': '<i class="fas fa-clock"></i>',
       'toggle': '<i class="fas fa-toggle-on"></i>',
       'scroll': '<i class="fas fa-arrows-alt-v"></i>',
-      'setOptions': '<i class="fas fa-list"></i>'
+      'setOptions': '<i class="fas fa-list"></i>',
+      'press': '<i class="fas fa-keyboard"></i>',
+      'navigate': '<i class="fas fa-link"></i>',
+      'assert': '<i class="fas fa-check-circle"></i>'
     };
     return iconMap[type] || '<i class="fas fa-circle"></i>';
   }
@@ -1457,13 +1520,60 @@ class RecordingManager {
    * 添加步骤
    */
   addStep(step) {
-    this.recordedSteps.push({
+    let recordedAt = new Date(step.timestamp || Date.now());
+    if (Number.isNaN(recordedAt.getTime())) recordedAt = new Date();
+    const incoming = {
       ...step,
-      timestamp: new Date().toISOString()
-    });
+      timestamp: recordedAt.toISOString()
+    };
+
+    // content script 的防抖输入会先发一次 stepRecorded，再在输入结束后补发最终值。
+    // 用 clientStepId 合并，避免侧边栏出现重复步骤。
+    if (incoming.clientStepId) {
+      const existingIndex = this.recordedSteps.findIndex(
+        item => item.clientStepId === incoming.clientStepId
+      );
+      if (existingIndex >= 0) {
+        this.recordedSteps[existingIndex] = {
+          ...this.recordedSteps[existingIndex],
+          ...incoming
+        };
+        this.updateStepsList();
+        this.updateRecordCount();
+        this.saveStepsToSession();
+        return;
+      }
+    }
+
+    this.recordedSteps.push(incoming);
     this.updateStepsList();
     this.updateRecordCount();
     this.saveStepsToSession();
+  }
+
+  /**
+   * AI 截图/描述异步回填：按 clientStepId 优先匹配，兼容旧 stepIndex。
+   */
+  updateStepEnhancement({ clientStepId, stepIndex, snapshotId, visualDescription } = {}) {
+    let index = -1;
+    if (clientStepId) {
+      index = this.recordedSteps.findIndex(step => step.clientStepId === clientStepId);
+    }
+    if (index < 0 && Number.isInteger(stepIndex) && stepIndex >= 0 && stepIndex < this.recordedSteps.length) {
+      index = stepIndex;
+    }
+    if (index < 0) return false;
+
+    const step = this.recordedSteps[index];
+    if (snapshotId) step.snapshotId = snapshotId;
+    if (visualDescription) {
+      step.visualDescription = visualDescription;
+      if (!step.description) step.description = visualDescription;
+    }
+
+    this.updateStepsList();
+    this.saveStepsToSession();
+    return true;
   }
 
   /**

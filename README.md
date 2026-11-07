@@ -55,8 +55,8 @@
 │   │   ├── folders.py               # 文件夹管理
 │   │   ├── execution.py             # AI 执行调度 + SSE 进度
 │   │   ├── recording.py             # 录制增强 (截图/描述/优化)
-│   │   ├── ai_service.py            # AI 服务 (Vision/断言/自愈/生成)
-│   │   ├── ai_heal.py               # AI 自愈
+│   │   ├── ai_service.py            # AI 服务 (Vision/断言/自愈/生成，唯一 AI 路由实现)
+│   │   ├── runs.py                  # Run 生命周期 + 性能分段 API
 │   │   ├── excel_io.py              # Excel 导入导出
 │   │   └── health.py                # 健康检查
 │   ├── agents/                      # AI Agent 模块
@@ -93,7 +93,8 @@
 │   └── modules/
 │       ├── managers/                # 用例/文件夹/录制管理器
 │       ├── execution/               # AI 执行管理器 (SSE 进度)
-│       ├── perf/                    # 性能追踪模块
+│       ├── runs/                    # RunClient + RunCoordinator（运行生命周期）
+│       ├── perf/                    # 性能追踪与 PerfSession 采集区间
 │       └── utils/                   # UI 工具
 │
 ├── perf-controller/                 # 可选的 Node.js 性能追踪服务
@@ -109,8 +110,16 @@
 | **用例管理** | | |
 | GET/POST | `/api/cases` | 列出/创建用例 |
 | GET/PUT/DELETE | `/api/cases/:id` | 读取/更新/删除用例 |
-| POST | `/api/cases/:id/execute` | 记录执行 |
+| POST | `/api/cases/:id/execute` | 已废弃，返回 410；请使用 Run API |
 | PATCH | `/api/cases/:id/heal-step` | AI 自愈更新选择器 |
+| **Run 生命周期** ⭐ | | |
+| POST | `/api/runs` | 创建真实运行记录 |
+| GET | `/api/runs/:runId` | 读取运行详情 |
+| PATCH | `/api/runs/:runId` | 更新运行进度元数据 |
+| POST | `/api/runs/:runId/perf-segments` | 追加一段性能采集结果 |
+| POST | `/api/runs/:runId/finish` | 幂等结束运行并更新用例统计 |
+| GET | `/api/runs/:runId/perf` | 读取运行的全部性能分段 |
+| GET | `/api/cases/:caseId/runs` | 列出某用例的运行历史 |
 | **文件夹** | | |
 | GET/POST | `/api/folders` | 列出/创建文件夹 |
 | GET | `/api/folders/tree` | 树形结构 |
@@ -137,6 +146,19 @@
 
 ⭐ = 平台增强能力
 
+### Run 生命周期
+
+扩展是默认执行面：`RunCoordinator` 在真实步骤执行前创建 Run，执行过程中按步骤或整条用例追加性能分段，完成后调用 `finish` 写入最终状态。后端只接受真实的运行结果，不再根据单次 HTTP 调用伪造成功记录。
+
+```text
+POST /api/runs                         -> running
+POST /api/runs/:id/perf-segments       -> 每步或整条用例的性能分段
+POST /api/runs/:id/finish              -> passed | failed | stopped | error
+GET  /api/runs/:id/perf                -> 回读性能分段
+```
+
+完整字段与示例见 `docs/api/runs.md`。
+
 ## 快速开始
 
 ### 1. 安装后端依赖
@@ -157,6 +179,14 @@ cp .env.example server/.env
 
 数据库固定使用 SQLite，默认路径为 `server/instance/automation_cases.db`，无需安装或启动数据库服务。
 如需调整数据文件位置，可设置 `SQLITE_DB_PATH`；相对路径以 `server/` 目录为基准。
+
+从旧版本升级时，先备份数据库，再执行一次幂等迁移：
+
+```bash
+python3 server/scripts/migrate_sqlite.py
+# 或指定数据库
+python3 server/scripts/migrate_sqlite.py --db /path/to/automation_cases.db
+```
 
 历史 MySQL 迁移脚本已归档到 `backup/mysql-migration/`，不属于运行时依赖。
 
@@ -194,23 +224,19 @@ python app.py
 
 ## 执行流程
 
-```
-用户选择用例 → 点击「AI 执行」
-     │
-     ▼
-Flask 后端启动后台线程
-     │
-     ▼
-LangGraph Pipeline:
-  parse → plan → execute → assert → increment → ... → report
-     │                              │
-     │  每步完成后通过 SSE 推送进度     │  失败时触发 Vision Agent 自愈
-     │                              │
-     ▼                              ▼
-Chrome 扩展实时更新进度面板      自动定位替代元素继续执行
-     │
-     ▼
-执行完成 → Allure 报告 + Langfuse 追踪
+默认执行面是 Chrome 扩展：页面操作可见、可停止，Run 与性能分段随执行过程写入 SQLite。Flask 的 Playwright + LangGraph 执行器保留为可选能力，用于服务端无人值守执行。
+
+```text
+扩展执行（默认）
+用户选择用例 → RunCoordinator 创建 Run
+            → Background/Content 逐步执行
+            → PerfSession 按步或整条用例采集
+            → 追加 perf-segments → finish(passed|failed|stopped|error)
+
+服务端执行（可选）
+POST /api/execution/run/:caseId
+            → LangGraph: parse → plan → execute → assert → report
+            → ExecutionLog + SSE 进度 + Allure/Langfuse
 ```
 
 ## 数据库模型
@@ -221,11 +247,22 @@ Chrome 扩展实时更新进度面板      自动定位替代元素继续执行
 - `setup_steps` — 前置条件步骤
 - `execution_count` / `success_rate` — 执行统计
 
-### ExecutionLog（执行日志）
+### ExecutionLog（Run 运行记录）
+- `run_id` — 对外稳定运行 ID
+- `executor` — `extension` / `playwright` / `legacy`
+- `perf_mode` — `step` / `case` / `none`
+- `perf_summary` — 运行级性能摘要 JSON
+- `steps_total` / `steps_passed` / `steps_failed` — 步骤统计
 - `task_id` — 异步执行任务 ID
-- `final_result` — pass / fail / error / uncertain
+- `final_result` — `passed` / `failed` / `stopped` / `error`
 - `steps_result` — 每步执行结果 JSON
 - `llm_usage` — LLM token 用量 JSON
+
+### RunPerfSegment（性能分段）
+- `run_id` + `segment_index` 唯一标识一段性能结果
+- `scope` — `step` 或 `case`
+- `step_index` — 单步模式下的步骤序号
+- `summary_json` — CDP Tracing 归一化摘要
 
 ### StepSnapshot（步骤截图）⭐ 新增
 - 截图文件路径 + Vision Agent 生成的 AI 描述
@@ -248,5 +285,7 @@ Chrome 扩展实时更新进度面板      自动定位替代元素继续执行
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `SQLITE_DB_PATH` | SQLite 数据文件路径 | `server/instance/automation_cases.db` |
+| `PORT` | Flask 监听端口 | `5001` |
+| `FLASK_DEBUG` | 设为 `1` 时开启调试模式 | `0` |
 | `AGENT_CONFIG` | AI 配置文件路径 | `server/agent_config.yaml` |
 | `DASHSCOPE_API_KEY` | 千问 API Key (替代配置文件) | — |

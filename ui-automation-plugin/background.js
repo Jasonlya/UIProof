@@ -12,6 +12,7 @@ chrome.action.onClicked.addListener(async (tab) => {
 // 执行状态管理（用于跨页面执行）
 let executionState = {
   isExecuting: false,
+  stopRequested: false,
   steps: [],
   currentIndex: 0,
   intervalMs: 0,
@@ -120,6 +121,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         
         executionState = {
           isExecuting: true,
+          stopRequested: false,
           steps: Array.isArray(msg.steps) ? msg.steps : [],
           currentIndex: 0,
           intervalMs: Math.max(0, Number(msg.intervalMs || 0)),
@@ -145,8 +147,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       // 停止执行
       if (msg && msg.type === 'stopExecution') {
         executionState.isExecuting = false;
+        executionState.stopRequested = true;
         await chrome.storage.local.remove('uiap_execution_state');
-        sendResponse({ ok: true });
+        sendResponse({ ok: true, stoppedAt: Date.now() });
         return;
       }
       // 页面跳转后继续执行
@@ -224,7 +227,7 @@ async function executeSteps(tabId) {
     console.log('🚀 开始执行步骤，当前索引:', executionState.currentIndex, '总步骤:', executionState.steps.length);
     
     // 继续执行剩余步骤
-    while (executionState.isExecuting && 
+    while (executionState.isExecuting && !executionState.stopRequested &&
            executionState.currentIndex < executionState.steps.length) {
       
       const step = executionState.steps[executionState.currentIndex];

@@ -7,6 +7,11 @@ import base64
 import json
 import logging
 
+from services.ai_payloads import (
+    normalize_generate_payload as _normalize_generate_payload,
+    normalize_heal_payload as _normalize_heal_payload,
+)
+
 logger = logging.getLogger(__name__)
 
 bp = Blueprint('ai_service', __name__, url_prefix='/api/ai')
@@ -83,22 +88,31 @@ async def _assert_async(image_base64: str, expected: str, step_index: int) -> di
 @bp.route('/heal', methods=['POST'])
 def ai_heal():
     """AI 自愈 — 当选择器失败时，分析 DOM 找到替代选择器（保留原接口）"""
-    data = request.get_json() or {}
-    failed_selector = data.get("failed_selector", "")
-    html_context = data.get("html_context", "")
-    element_description = data.get("element_description", "")
+    payload = _normalize_heal_payload(request.get_json(silent=True) or {})
+    failed_selector = payload["failed_selector"]
+    html_context = payload["html_context"]
+    element_description = payload["element_description"]
 
+    if not failed_selector:
+        return jsonify({"ok": False, "error": "缺少 selector 参数"}), 400
     if not html_context:
-        return jsonify({"error": "缺少页面上下文"}), 400
+        return jsonify({"ok": False, "error": "缺少页面上下文"}), 400
 
     try:
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(_heal_async(failed_selector, html_context, element_description))
-        loop.close()
+        try:
+            result = loop.run_until_complete(
+                _heal_async(failed_selector, html_context, element_description)
+            )
+        finally:
+            loop.close()
+        if not isinstance(result, dict):
+            result = {}
+        result.setdefault("ok", bool(result.get("selector")))
         return jsonify(result)
     except Exception as e:
         logger.error(f"AI 自愈失败: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 async def _heal_async(failed_selector: str, html_context: str, description: str) -> dict:
@@ -138,22 +152,26 @@ async def _heal_async(failed_selector: str, html_context: str, description: str)
 @bp.route('/generate-cases', methods=['POST'])
 def generate_cases():
     """AI 自动生成测试用例（保留原接口，增强实现）"""
-    data = request.get_json() or {}
-    elements = data.get("elements", [])
-    page_url = data.get("page_url", "")
-    page_title = data.get("page_title", "")
+    payload = _normalize_generate_payload(request.get_json(silent=True) or {})
+    elements = payload["elements"]
+    page_url = payload["page_url"]
+    page_title = payload["page_title"]
 
     if not elements:
-        return jsonify({"error": "缺少页面元素数据"}), 400
+        return jsonify({"ok": False, "error": "缺少页面元素数据"}), 400
 
     try:
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(_generate_async(elements, page_url, page_title))
-        loop.close()
-        return jsonify(result)
+        try:
+            result = loop.run_until_complete(_generate_async(elements, page_url, page_title))
+        finally:
+            loop.close()
+        if not isinstance(result, dict):
+            result = {}
+        return jsonify({"ok": True, **result})
     except Exception as e:
         logger.error(f"AI 生成用例失败: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e), "cases": []}), 500
 
 
 async def _generate_async(elements: list, page_url: str, page_title: str) -> dict:

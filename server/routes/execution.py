@@ -3,10 +3,10 @@
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 from models.models import db, TestCase, ExecutionLog
 import asyncio
+from datetime import datetime
 import json
 import logging
 import threading
-import time
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ def run_case(case_id):
         case_id=case_id,
         task_id=task_id,
         status="running",
-        start_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+        start_time=datetime.utcnow(),
     )
     db.session.add(log)
     db.session.commit()
@@ -90,7 +90,7 @@ def run_batch():
             case_id=case.case_id,
             task_id=task_id,
             status="running",
-            start_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+            start_time=datetime.utcnow(),
         )
         db.session.add(log)
     db.session.commit()
@@ -187,6 +187,7 @@ def stop_execution(task_id):
         return jsonify({"error": "任务不存在"}), 404
 
     task["status"] = "stopped"
+    task["stop_requested"] = True
     return jsonify({"task_id": task_id, "status": "stopped"})
 
 
@@ -207,9 +208,11 @@ def _run_in_thread(task_id, case_data, progress_queue, log_id):
         # 更新执行日志
         log = ExecutionLog.query.get(log_id)
         if log:
-            log.status = "completed"
-            log.end_time = time.strftime("%Y-%m-%d %H:%M:%S")
-            log.final_result = result.get("final_result", "unknown")
+            task = _execution_tasks.get(task_id, {})
+            stopped = bool(task.get("stop_requested")) or task.get("status") == "stopped"
+            log.status = "stopped" if stopped else "completed"
+            log.end_time = datetime.utcnow()
+            log.final_result = "stopped" if stopped else result.get("final_result", "unknown")
             log.set_steps_result([
                 r.to_dict() if hasattr(r, 'to_dict') else r
                 for r in result.get("step_results", [])
@@ -220,27 +223,29 @@ def _run_in_thread(task_id, case_data, progress_queue, log_id):
                 log.video_path = result["report"]["video_path"]
             db.session.commit()
 
-            # 更新用例统计
-            case = TestCase.query.filter_by(case_id=case_data["id"]).first()
-            if case:
-                case.execution_count = (case.execution_count or 0) + 1
-                case.last_executed = time.strftime("%Y-%m-%d %H:%M:%S")
-                total = case.execution_count
-                passed = int(case.success_rate * (total - 1))
-                if result.get("final_result") == "pass":
-                    passed += 1
-                case.success_rate = passed / total if total > 0 else 0.0
-                db.session.commit()
+            # 更新用例统计；主动停止不计为通过
+            if not stopped:
+                case = TestCase.query.filter_by(case_id=case_data["id"]).first()
+                if case:
+                    case.execution_count = (case.execution_count or 0) + 1
+                    case.last_executed = datetime.utcnow()
+                    total = case.execution_count
+                    passed = int((case.success_rate or 0.0) * (total - 1))
+                    if result.get("final_result") == "pass":
+                        passed += 1
+                    case.success_rate = passed / total if total > 0 else 0.0
+                    db.session.commit()
 
         # 推送完成消息
         loop.run_until_complete(progress_queue.put({
             "type": "execution_complete",
             "task_id": task_id,
-            "final_result": result.get("final_result", "unknown"),
+            "final_result": "stopped" if _execution_tasks.get(task_id, {}).get("stop_requested") else result.get("final_result", "unknown"),
         }))
 
         if task_id in _execution_tasks:
-            _execution_tasks[task_id]["status"] = "completed"
+            if not _execution_tasks[task_id].get("stop_requested"):
+                _execution_tasks[task_id]["status"] = "completed"
 
         loop.close()
 
@@ -250,7 +255,7 @@ def _run_in_thread(task_id, case_data, progress_queue, log_id):
         log = ExecutionLog.query.get(log_id) if log_id else None
         if log:
             log.status = "failed"
-            log.end_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            log.end_time = datetime.utcnow()
             log.error_message = str(e)
             log.final_result = "error"
             db.session.commit()
@@ -279,14 +284,17 @@ def _run_batch_in_thread(task_id, cases_data, progress_queue):
             run_cases_batch(cases_data, progress_queue=progress_queue)
         )
 
+        task = _execution_tasks.get(task_id, {})
+        stopped = bool(task.get("stop_requested")) or task.get("status") == "stopped"
+
         # 更新所有执行日志
         for result in results:
             case_data = result.get("case", {})
             logs = ExecutionLog.query.filter_by(task_id=task_id, case_id=case_data.get("id")).all()
             for log in logs:
-                log.status = "completed"
-                log.end_time = time.strftime("%Y-%m-%d %H:%M:%S")
-                log.final_result = result.get("final_result", "unknown")
+                log.status = "stopped" if stopped else "completed"
+                log.end_time = datetime.utcnow()
+                log.final_result = "stopped" if stopped else result.get("final_result", "unknown")
                 log.set_steps_result([
                     r.to_dict() if hasattr(r, 'to_dict') else r
                     for r in result.get("step_results", [])
@@ -300,13 +308,21 @@ def _run_batch_in_thread(task_id, cases_data, progress_queue):
             "passed": sum(1 for r in results if r.get("final_result") == "pass"),
         }))
 
-        if task_id in _execution_tasks:
+        if task_id in _execution_tasks and not stopped:
             _execution_tasks[task_id]["status"] = "completed"
 
         loop.close()
 
     except Exception as e:
         logger.error(f"批量执行异常: {e}", exc_info=True)
+        db.session.rollback()
+        logs = ExecutionLog.query.filter_by(task_id=task_id).all()
+        for log in logs:
+            log.status = "failed"
+            log.end_time = datetime.utcnow()
+            log.error_message = str(e)
+            log.final_result = "error"
+        db.session.commit()
         if task_id in _execution_tasks:
             _execution_tasks[task_id]["status"] = "failed"
 

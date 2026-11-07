@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify, current_app
 from datetime import datetime
 import json
 from models.models import TestCase, ExecutionLog, db
+from services.step_schema import StepValidationError, dump_steps, normalize_steps
 
 bp = Blueprint('cases', __name__, url_prefix='/api')
 
@@ -121,24 +122,20 @@ def create_case():
     
     current_app.logger.info(f'✅ 验证通过 - 名称: {data.get("name")}, 描述: {data.get("description", "无")}, 分类: {data.get("category", "默认")}, 标签: {data.get("tags", "无")}')
     
-    steps_data = data.get('steps', '[]')
-    if isinstance(steps_data, str):
-        try:
-            parsed_steps = json.loads(steps_data)
-            current_app.logger.info(f'步骤数据解析成功 - 步骤数: {len(parsed_steps)}')
-            for i, step in enumerate(parsed_steps):
-                current_app.logger.info(f'步骤 {i+1}: {step}')
-        except json.JSONDecodeError as e:
-            current_app.logger.warning(f'步骤数据JSON解析失败: {e}')
-    else:
-        current_app.logger.info(f'步骤数据: {steps_data}')
+    try:
+        normalized_steps = normalize_steps(data.get('steps', '[]'))
+    except StepValidationError as exc:
+        current_app.logger.warning(f'步骤数据校验失败: {exc}')
+        return jsonify({'error': str(exc)}), 400
+
+    current_app.logger.info(f'步骤数据校验通过 - 步骤数: {len(normalized_steps)}')
     
     case = TestCase(
         name=data['name'],
         description=data.get('description', ''),
         category=data.get('category', 'default'),
         tags=data.get('tags', ''),
-        steps=data.get('steps', '[]'),
+        steps=dump_steps(normalized_steps),
         folder_id=data.get('folder_id', None)
     )
     
@@ -152,6 +149,7 @@ def create_case():
     
     response_data = {
         'message': '用例创建成功',
+        'steps_count': len(normalized_steps),
         'case': {
             'id': case.id,
             'case_id': case.case_id,
@@ -160,6 +158,7 @@ def create_case():
             'category': case.category,
             'tags': case.tags,
             'steps': case.steps,
+            'steps_count': len(normalized_steps),
             'status': case.status,
             'created_at': case.created_at.isoformat()
         }
@@ -241,6 +240,16 @@ def update_case(case_id):
     data = request.get_json()
     current_app.logger.info(f'请求体: {data}')
     current_app.logger.info(f'请求体大小: {len(str(data)) if data else 0} 字符')
+    if not isinstance(data, dict):
+        return jsonify({'error': '请求体必须是 JSON 对象'}), 400
+
+    normalized_steps = None
+    if 'steps' in data:
+        try:
+            normalized_steps = normalize_steps(data.get('steps'))
+        except StepValidationError as exc:
+            current_app.logger.warning(f'步骤数据校验失败: {exc}')
+            return jsonify({'error': str(exc)}), 400
     
     if 'name' in data:
         case.name = data['name']
@@ -251,7 +260,7 @@ def update_case(case_id):
     if 'tags' in data:
         case.tags = data['tags']
     if 'steps' in data:
-        case.steps = data['steps']
+        case.steps = dump_steps(normalized_steps or [])
     if 'status' in data:
         case.status = data['status']
     if 'folder_id' in data:
@@ -263,7 +272,10 @@ def update_case(case_id):
     current_app.logger.info(f'✅ 用例更新成功 - ID: {case.case_id}, 名称: {case.name}')
     current_app.logger.info(f'更新后步骤数据: {case.steps}')
     
-    response_data = {'message': '用例更新成功'}
+    response_data = {
+        'message': '用例更新成功',
+        'steps_count': len(normalized_steps) if normalized_steps is not None else len(case.get_steps())
+    }
     current_app.logger.info('📤 响应数据:')
     current_app.logger.info(f'状态码: 200')
     current_app.logger.info(f'响应体: {response_data}')
@@ -285,31 +297,10 @@ def delete_case(case_id):
 
 @bp.route('/cases/<case_id>/execute', methods=['POST'])
 def execute_case(case_id):
-    case = TestCase.query.filter_by(case_id=case_id).first()
-    
-    if not case:
-        return jsonify({'error': '用例不存在'}), 404
-    
-    execution_log = ExecutionLog(
-        case_id=case_id,
-        status='running'
-    )
-    db.session.add(execution_log)
-    db.session.commit()
-    
-    case.execution_count += 1
-    case.last_executed = datetime.utcnow()
-    db.session.commit()
-    
-    execution_log.status = 'success'
-    execution_log.end_time = datetime.utcnow()
-    db.session.commit()
-    
     return jsonify({
-        'message': '用例执行成功',
-        'execution_id': execution_log.id,
-        'status': 'success'
-    })
+        'error': 'deprecated',
+        'message': 'Use POST /api/runs to create a run and POST /api/runs/<run_id>/finish to finish it.'
+    }), 410
 
 @bp.route('/cases/<case_id>/executions', methods=['GET'])
 def get_case_executions(case_id):
@@ -321,12 +312,21 @@ def get_case_executions(case_id):
     ).order_by(ExecutionLog.start_time.desc()).paginate(
         page=page, per_page=per_page, error_out=False
     )
+
+    def normalized_status(status):
+        return 'passed' if status in ('success', 'completed') else status
     
     return jsonify({
         'executions': [{
             'id': exec.id,
-            'status': exec.status,
-            'start_time': exec.start_time.isoformat(),
+            'run_id': exec.run_id,
+            'status': normalized_status(exec.status),
+            'executor': exec.executor,
+            'perf_mode': exec.perf_mode,
+            'steps_total': exec.steps_total or 0,
+            'steps_passed': exec.steps_passed or 0,
+            'steps_failed': exec.steps_failed or 0,
+            'start_time': exec.start_time.isoformat() if exec.start_time else None,
             'end_time': exec.end_time.isoformat() if exec.end_time else None,
             'error_message': exec.error_message,
             'execution_data': exec.execution_data
